@@ -402,7 +402,7 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("search_mode", None)
         rows = count_by_subject(update.effective_user.id)
         if not rows:
-            await update.message.reply_text("لسّا ما عندك أرشيف. أرشف أول ملف ✅", reply_markup=MAIN_KB)
+            await update.message.reply_text(" ما عندك أرشيف. أرشف أول ملف ✅", reply_markup=MAIN_KB)
             return
 
         buttons = []
