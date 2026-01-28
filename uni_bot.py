@@ -1,8 +1,7 @@
 import os
 import sqlite3
-import logging
 from datetime import datetime
-from typing import Optional, Iterable, Tuple, Any
+from typing import Optional, List, Tuple, Dict
 
 from telegram import (
     Update,
@@ -21,37 +20,31 @@ from telegram.ext import (
     filters,
 )
 
-# =========================
+# =======================
 # Config
-# =========================
+# =======================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DB_PATH = os.getenv("DB_PATH", "archive.db").strip() or "archive.db"
-TZ_NOTE = "UTC"  # نخليها UTC لأننا نخزن datetime.utcnow()
+DB_PATH = os.getenv("DB_PATH", "archive.db").strip()
 
-# Logging (Railway يحب هذا)
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-log = logging.getLogger("uni-bot")
-
-
-# =========================
-# UI (Keyboards)
-# =========================
-MAIN_KB = ReplyKeyboardMarkup(
-    [
-        [KeyboardButton("📚 المواد"), KeyboardButton("🗂️ نسخة احتياطية")],
-        [KeyboardButton("🧾 آخر الملفات"), KeyboardButton("⭐ المفضلة")],
-        [KeyboardButton("🔎 بحث"), KeyboardButton("ℹ️ مساعدة")],
-    ],
-    resize_keyboard=True,
-)
+DEFAULT_PAGE_SIZE = 10
+MAX_LIST_LIMIT = 100
 
 SUBJECTS = [
     "Grammar", "Phonetics", "Poetry", "Drama", "Novel",
     "Listening", "Writing", "Linguistics", "ELT", "Other"
 ]
+
+# =======================
+# Keyboards (UI)
+# =======================
+MAIN_KB = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("📚 المواد"), KeyboardButton("🧾 آخر الملفات")],
+        [KeyboardButton("⭐ المفضلة"), KeyboardButton("🔎 بحث")],
+        [KeyboardButton("🗂️ نسخة احتياطية"), KeyboardButton("ℹ️ مساعدة")],
+    ],
+    resize_keyboard=True,
+)
 
 def subjects_keyboard() -> ReplyKeyboardMarkup:
     rows = []
@@ -66,16 +59,41 @@ def subjects_keyboard() -> ReplyKeyboardMarkup:
     rows.append([KeyboardButton("⬅️ رجوع")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
-BACK_KB = ReplyKeyboardMarkup([[KeyboardButton("⬅️ رجوع")]], resize_keyboard=True)
+def subject_actions_keyboard(subject: str) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("📤 أرشفة ملف جديد"), KeyboardButton("📂 عرض ملفات المادة")],
+            [KeyboardButton("⬅️ رجوع")],
+        ],
+        resize_keyboard=True,
+    )
 
+def inline_fav_keyboard(row_id: int, is_fav: int) -> InlineKeyboardMarkup:
+    # زر واحد يتبدّل حسب الحالة
+    if is_fav:
+        btn = InlineKeyboardButton("⭐ موجودة بالمفضلة (إزالة)", callback_data=f"fav:{row_id}:0")
+    else:
+        btn = InlineKeyboardButton("☆ إضافة للمفضلة", callback_data=f"fav:{row_id}:1")
+    return InlineKeyboardMarkup([[btn]])
 
-# =========================
-# DB Layer
-# =========================
-def db_connect() -> sqlite3.Connection:
+def inline_subject_files_nav(subject: str, offset: int, page_size: int, has_more: bool) -> InlineKeyboardMarkup:
+    buttons = []
+    if offset > 0:
+        prev_offset = max(0, offset - page_size)
+        buttons.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"subnav:{subject}:{prev_offset}:{page_size}"))
+    if has_more:
+        next_offset = offset + page_size
+        buttons.append(InlineKeyboardButton("التالي ➡️", callback_data=f"subnav:{subject}:{next_offset}:{page_size}"))
+    if not buttons:
+        # إذا صفحة واحدة، لا نعرض شي
+        return InlineKeyboardMarkup([[]])
+    return InlineKeyboardMarkup([buttons])
+
+# =======================
+# Database
+# =======================
+def db() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL;")  # أفضل للاستخدام المتكرر
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS files (
@@ -106,323 +124,405 @@ def insert_file(
     file_unique_id: str,
     caption: Optional[str],
 ) -> int:
-    created_at = datetime.utcnow().isoformat()
-    with db_connect() as con:
-        cur = con.cursor()
-        cur.execute(
-            """
-            INSERT INTO files (user_id, chat_id, message_id, subject, file_type, file_id, file_unique_id, caption, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                chat_id,
-                message_id,
-                subject,
-                file_type,
-                file_id,
-                file_unique_id,
-                (caption or "").strip(),
-                created_at,
-            ),
-        )
-        con.commit()
-        return int(cur.lastrowid)
-
-def list_recent(user_id: int, limit: int = 10) -> Iterable[sqlite3.Row]:
-    with db_connect() as con:
-        cur = con.cursor()
-        cur.execute(
-            """
-            SELECT id, subject, file_type, caption, created_at, is_fav
-            FROM files
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (user_id, limit),
-        )
-        return cur.fetchall()
-
-def list_favs(user_id: int, limit: int = 20) -> Iterable[sqlite3.Row]:
-    with db_connect() as con:
-        cur = con.cursor()
-        cur.execute(
-            """
-            SELECT id, subject, file_type, caption, created_at, is_fav
-            FROM files
-            WHERE user_id = ? AND is_fav = 1
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (user_id, limit),
-        )
-        return cur.fetchall()
-
-def set_fav(user_id: int, file_row_id: int, fav: int) -> None:
-    with db_connect() as con:
-        con.execute(
-            "UPDATE files SET is_fav = ? WHERE user_id = ? AND id = ?",
-            (fav, user_id, file_row_id),
-        )
-        con.commit()
-
-def search_files(user_id: int, q: str, limit: int = 20) -> Iterable[sqlite3.Row]:
-    q = (q or "").strip().lower()
-    with db_connect() as con:
-        cur = con.cursor()
-        cur.execute(
-            """
-            SELECT id, subject, file_type, caption, created_at, is_fav
-            FROM files
-            WHERE user_id = ?
-              AND (LOWER(subject) LIKE ? OR LOWER(caption) LIKE ?)
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (user_id, f"%{q}%", f"%{q}%", limit),
-        )
-        return cur.fetchall()
-
-
-# =========================
-# Helpers
-# =========================
-def is_archive_mode(context: ContextTypes.DEFAULT_TYPE) -> bool:
-    return bool(context.user_data.get("awaiting_file", False))
-
-def human_date(iso: str) -> str:
-    # ISO -> YYYY-MM-DD
-    try:
-        return iso.split("T")[0]
-    except Exception:
-        return iso
-
-def pretty_row(r: sqlite3.Row) -> str:
-    star = "⭐" if int(r["is_fav"]) == 1 else "☆"
-    cap = (r["caption"] or "").strip()
-    if len(cap) > 60:
-        cap = cap[:60] + "…"
-    return f"{star} #{r['id']} | {r['subject']} | {r['file_type']} | {cap or '—'} | {human_date(r['created_at'])}"
-
-def inline_fav_kb(row_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("⭐ مفضلة", callback_data=f"fav:{row_id}:1"),
-            InlineKeyboardButton("☆ إزالة", callback_data=f"fav:{row_id}:0"),
-        ]]
+    con = db()
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO files (user_id, chat_id, message_id, subject, file_type, file_id, file_unique_id, caption, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            chat_id,
+            message_id,
+            subject,
+            file_type,
+            file_id,
+            file_unique_id,
+            (caption or "").strip(),
+            datetime.utcnow().isoformat(),
+        ),
     )
+    con.commit()
+    new_id = cur.lastrowid
+    con.close()
+    return new_id
 
-def detect_subject_from_caption(caption: str) -> Optional[str]:
-    """
-    ذكيّة بسيطة:
-    - إذا المستخدم كتب: Grammar - Unit 1
-    - أو: grammar: unit 1
-    نلتقط المادة تلقائياً إذا تطابق اسمها.
-    """
-    if not caption:
-        return None
-    low = caption.strip().lower()
-    for s in SUBJECTS:
-        if low.startswith(s.lower() + " -") or low.startswith(s.lower() + ":") or low == s.lower():
-            return s
-    return None
+def list_recent(user_id: int, limit: int = 10):
+    con = db()
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT id, subject, file_type, caption, created_at, is_fav
+        FROM files
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (user_id, min(limit, MAX_LIST_LIMIT)),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return rows
 
+def list_favs(user_id: int, limit: int = 20):
+    con = db()
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT id, subject, file_type, caption, created_at, is_fav
+        FROM files
+        WHERE user_id = ? AND is_fav = 1
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (user_id, min(limit, MAX_LIST_LIMIT)),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return rows
 
-# =========================
+def set_fav(user_id: int, file_row_id: int, fav: int):
+    con = db()
+    cur = con.cursor()
+    cur.execute(
+        "UPDATE files SET is_fav = ? WHERE user_id = ? AND id = ?",
+        (fav, user_id, file_row_id),
+    )
+    con.commit()
+    con.close()
+
+def search_files(user_id: int, q: str, limit: int = 20):
+    q = (q or "").strip()
+    con = db()
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT id, subject, file_type, caption, created_at, is_fav
+        FROM files
+        WHERE user_id = ?
+          AND (LOWER(subject) LIKE ? OR LOWER(caption) LIKE ?)
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (user_id, f"%{q.lower()}%", f"%{q.lower()}%", min(limit, MAX_LIST_LIMIT)),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return rows
+
+def list_by_subject(user_id: int, subject: str, limit: int, offset: int):
+    con = db()
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT id, subject, file_type, caption, created_at, is_fav
+        FROM files
+        WHERE user_id = ? AND subject = ?
+        ORDER BY id DESC
+        LIMIT ? OFFSET ?
+        """,
+        (user_id, subject, min(limit, MAX_LIST_LIMIT), max(0, offset)),
+    )
+    rows = cur.fetchall()
+    con.close()
+    return rows
+
+def get_file_record(user_id: int, row_id: int):
+    con = db()
+    cur = con.cursor()
+    cur.execute(
+        """
+        SELECT id, user_id, chat_id, message_id, subject, file_type, caption, created_at, is_fav
+        FROM files
+        WHERE user_id = ? AND id = ?
+        """,
+        (user_id, row_id),
+    )
+    row = cur.fetchone()
+    con.close()
+    return row
+
+# =======================
+# Helpers
+# =======================
+def safe_cap(s: str, n: int = 50) -> str:
+    s = (s or "").strip()
+    if not s:
+        return "بدون وصف"
+    return (s[:n] + "…") if len(s) > n else s
+
+def pretty_row_short(row) -> str:
+    # (id, subject, file_type, caption, created_at, is_fav)
+    rid, subj, ftype, cap, created, is_fav = row
+    star = "⭐" if is_fav else "☆"
+    date = (created or "").split("T")[0] if created else ""
+    return f"{star} #{rid} • {safe_cap(cap, 38)} ({ftype}, {date})"
+
+def set_mode(context: ContextTypes.DEFAULT_TYPE, mode: str):
+    context.user_data["mode"] = mode
+
+def get_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
+    return context.user_data.get("mode", "idle")
+
+def current_subject(context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+    return context.user_data.get("subject")
+
+# =======================
 # Commands
-# =========================
+# =======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
+    set_mode(context, "idle")
     await update.message.reply_text(
         "يا هلا رأفت 👋\n"
-        "جاهز نخلي أرشيفك مرتب و(بدون وجع راس) 📚\n\n"
-        "• اختَر 📚 المواد ثم المادة\n"
-        "• بعدها ابعث ملف/صورة/PDF… مع وصف بالكابشن (اختياري)\n\n"
-        "تفضل 👇",
+        "أنا *Raafat Archive Bot* — خلّي ملفاتك منظمة مثل رفوف مكتبة 📚\n\n"
+        "ابدأ من زر: *📚 المواد* ثم اختر المادة.\n"
+        "بعدها إمّا تؤرشف ملف جديد أو تعرض ملفات المادة.",
         reply_markup=MAIN_KB,
-    )
-
-async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("search_mode", None)
-    await update.message.reply_text("هذه القائمة الرئيسية ✅", reply_markup=MAIN_KB)
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # يلغي أي وضع (بحث/أرشفة)
-    context.user_data.pop("awaiting_file", None)
-    context.user_data.pop("subject", None)
-    context.user_data.pop("search_mode", None)
-    await update.message.reply_text("تم الإلغاء ورجعناك للقائمة ✅", reply_markup=MAIN_KB)
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    subj = context.user_data.get("subject")
-    awaiting = bool(context.user_data.get("awaiting_file"))
-    searching = bool(context.user_data.get("search_mode"))
-    await update.message.reply_text(
-        "📌 الحالة الحالية:\n"
-        f"• وضع الأرشفة: {'✅' if awaiting else '❌'}\n"
-        f"• المادة المختارة: {subj or '—'}\n"
-        f"• وضع البحث: {'✅' if searching else '❌'}\n"
-        f"• قاعدة البيانات: {DB_PATH}\n"
-        f"• الوقت: {TZ_NOTE}",
-        reply_markup=MAIN_KB,
+        parse_mode=ParseMode.MARKDOWN,
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "ℹ️ مساعدة سريعة:\n\n"
-        "1) 📚 المواد → اختر مادة.\n"
-        "2) ابعث ملف/صورة/PDF…\n"
-        "3) اكتب وصف بالكابشن إذا تحب: (Unit 1 / Chapter 2 / امتحان…)\n\n"
-        "💡 خدعة ذكية:\n"
-        "إذا نسيت تختار مادة، اكتب بالكابشن بدايةً اسم المادة:\n"
-        "Grammar - Unit 1\n\n"
-        "أوامر مفيدة:\n"
-        "/menu — القائمة\n"
-        "/cancel — إلغاء الوضع الحالي\n"
-        "/status — حالة البوت",
+        "ℹ️ *طريقة الاستخدام السريعة:*\n"
+        "1) اضغط *📚 المواد* واختر مادة.\n"
+        "2) اختر:\n"
+        "   • *📤 أرشفة ملف جديد* ثم أرسل ملف/صورة/PDF…\n"
+        "   • *📂 عرض ملفات المادة* لعرض قائمة ملفاتها.\n\n"
+        "🧾 *آخر الملفات* يعرض آخر 10 ملفات.\n"
+        "⭐ *المفضلة* تعرض الملفات المعلّمة بنجمة.\n"
+        "🔎 *بحث* يفتّش في (اسم المادة + الوصف/الكابشن).\n\n"
+        "ملاحظة: أنا أخزن بيانات الملف في SQLite، والملف نفسه يبقى على تيليغرام.",
         reply_markup=MAIN_KB,
+        parse_mode=ParseMode.MARKDOWN,
     )
 
+# =======================
+# Subject files list (inline)
+# =======================
+async def send_subject_files_list(
+    update_or_query,
+    context: ContextTypes.DEFAULT_TYPE,
+    subject: str,
+    offset: int = 0,
+    page_size: int = DEFAULT_PAGE_SIZE
+):
+    user_id = update_or_query.effective_user.id
+    rows = list_by_subject(user_id, subject, page_size, offset)
 
-# =========================
+    # هل يوجد المزيد؟
+    # نتحقق بجلب عنصر إضافي صغير (حل بسيط)
+    more_check = list_by_subject(user_id, subject, 1, offset + page_size)
+    has_more = len(more_check) > 0
+
+    if not rows and offset == 0:
+        text = (
+            f"📘 *{subject}*\n"
+            "ماكو ملفات بعد بهاي المادة.\n\n"
+            "تريد تبدأ؟ اختر *📤 أرشفة ملف جديد* وارسِل ملفك."
+        )
+        # نرسل على حسب نوع المصدر (رسالة أو كولباك)
+        if hasattr(update_or_query, "message") and update_or_query.message:
+            await update_or_query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update_or_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    lines = [f"📘 *{subject}* — ملفاتك (صفحة {offset//page_size + 1})\n"]
+    for r in rows:
+        lines.append(pretty_row_short(r))
+
+    lines.append("\n✳️ *لإرسال ملف:* اكتب رقم الأرشفة مثل: `#12` أو فقط `12`.")
+    text = "\n".join(lines)
+
+    nav_kb = inline_subject_files_nav(subject, offset, page_size, has_more)
+
+    if hasattr(update_or_query, "message") and update_or_query.message:
+        await update_or_query.message.reply_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=nav_kb if nav_kb.inline_keyboard and nav_kb.inline_keyboard[0] else None,
+        )
+    else:
+        await update_or_query.edit_message_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=nav_kb if nav_kb.inline_keyboard and nav_kb.inline_keyboard[0] else None,
+        )
+
+# =======================
 # Menu Text Handler
-# =========================
+# =======================
 async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
+    mode = get_mode(context)
 
+    # ===== رجوع =====
     if text == "⬅️ رجوع":
-        await cancel(update, context)
+        context.user_data.pop("subject", None)
+        set_mode(context, "idle")
+        await update.message.reply_text("رجعناك للقائمة الرئيسية ✅", reply_markup=MAIN_KB)
         return
 
+    # ===== Main menu =====
     if text == "📚 المواد":
-        context.user_data.pop("search_mode", None)
+        set_mode(context, "choosing_subject")
         await update.message.reply_text("اختر المادة 👇", reply_markup=subjects_keyboard())
-        return
-
-    if text.startswith("📘 "):
-        subject = text.replace("📘 ", "").strip()
-        context.user_data["subject"] = subject
-        context.user_data["awaiting_file"] = True
-        context.user_data.pop("search_mode", None)
-
-        await update.message.reply_text(
-            f"تمام ✅\n"
-            f"المادة الحالية: {subject}\n\n"
-            "الآن ابعث ملف/صورة/PDF…\n"
-            "وإذا تحب، اكتب وصف بالكابشن مثل: Unit 1 / Midterm / Lecture 3",
-            reply_markup=BACK_KB,
-        )
-        return
-
-    if text == "🧾 آخر الملفات":
-        context.user_data.pop("search_mode", None)
-        rows = list_recent(update.effective_user.id, 10)
-        if not rows:
-            await update.message.reply_text(
-                "لسّا ما عندك ملفات مؤرشفة.\nابدأ من 📚 المواد ✅",
-                reply_markup=MAIN_KB,
-            )
-            return
-        msg = "🧾 آخر الملفات:\n\n" + "\n".join(pretty_row(r) for r in rows)
-        await update.message.reply_text(msg, reply_markup=MAIN_KB)
-        return
-
-    if text == "⭐ المفضلة":
-        context.user_data.pop("search_mode", None)
-        rows = list_favs(update.effective_user.id, 20)
-        if not rows:
-            await update.message.reply_text(
-                "المفضلة فارغة ⭐\n"
-                "بعد ما تؤرشف ملف، اضغط زر ⭐ مفضلة تحت رسالة الأرشفة.",
-                reply_markup=MAIN_KB,
-            )
-            return
-        msg = "⭐ المفضلة:\n\n" + "\n".join(pretty_row(r) for r in rows)
-        await update.message.reply_text(msg, reply_markup=MAIN_KB)
-        return
-
-    if text == "🔎 بحث":
-        context.user_data["search_mode"] = True
-        context.user_data.pop("awaiting_file", None)  # حتى ما يختلط وضع البحث والأرشفة
-        await update.message.reply_text(
-            "اكتب كلمة البحث الآن 🔎\n"
-            "مثال: unit 1 / midterm / grammar",
-            reply_markup=MAIN_KB,
-        )
-        return
-
-    if text == "🗂️ نسخة احتياطية":
-        if os.path.exists(DB_PATH):
-            try:
-                with open(DB_PATH, "rb") as f:
-                    await update.message.reply_document(
-                        document=f,
-                        filename=os.path.basename(DB_PATH),
-                        caption="🗂️ نسخة احتياطية لقاعدة البيانات (SQLite).",
-                        reply_markup=MAIN_KB,
-                    )
-            except Exception as e:
-                log.exception("Backup send failed: %s", e)
-                await update.message.reply_text("صار خطأ وأنا أرسل النسخة الاحتياطية 😅", reply_markup=MAIN_KB)
-        else:
-            await update.message.reply_text("ماكو قاعدة بيانات بعد. أرشف أول ملف حتى تنخلق ✅", reply_markup=MAIN_KB)
         return
 
     if text == "ℹ️ مساعدة":
         await help_cmd(update, context)
         return
 
-    # Search mode
-    if context.user_data.get("search_mode"):
-        q = text
-        rows = search_files(update.effective_user.id, q, 20)
+    if text == "🧾 آخر الملفات":
+        set_mode(context, "idle")
+        rows = list_recent(update.effective_user.id, 10)
         if not rows:
-            await update.message.reply_text(f"ما لقيت شي عن: {q}\nجرّب كلمة ثانية.", reply_markup=MAIN_KB)
+            await update.message.reply_text("لسّا ما عندك ملفات مؤرشفة. ابدأ من 📚 المواد ✅", reply_markup=MAIN_KB)
             return
-        msg = f"🔎 نتائج البحث عن: {q}\n\n" + "\n".join(pretty_row(r) for r in rows)
-        await update.message.reply_text(msg, reply_markup=MAIN_KB)
+        msg = "🧾 *آخر الملفات:*\n\n" + "\n".join(pretty_row_short(r) for r in rows)
+        msg += "\n\n✳️ لإرسال ملف: اكتب رقم الأرشفة مثل `12`."
+        await update.message.reply_text(msg, reply_markup=MAIN_KB, parse_mode=ParseMode.MARKDOWN)
         return
 
-    # Fallback
+    if text == "⭐ المفضلة":
+        set_mode(context, "idle")
+        rows = list_favs(update.effective_user.id, 20)
+        if not rows:
+            await update.message.reply_text("المفضلة فارغة ⭐\nبعد ما تؤرشف ملف، اضغط ☆ إضافة للمفضلة.", reply_markup=MAIN_KB)
+            return
+        msg = "⭐ *المفضلة:*\n\n" + "\n".join(pretty_row_short(r) for r in rows)
+        msg += "\n\n✳️ لإرسال ملف: اكتب رقم الأرشفة مثل `12`."
+        await update.message.reply_text(msg, reply_markup=MAIN_KB, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if text == "🔎 بحث":
+        set_mode(context, "search_waiting")
+        await update.message.reply_text("اكتب كلمة البحث الآن 🔎\nمثال: `unit 1` أو `grammar`", reply_markup=MAIN_KB, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if text == "🗂️ نسخة احتياطية":
+        set_mode(context, "idle")
+        if os.path.exists(DB_PATH):
+            await update.message.reply_document(
+                document=open(DB_PATH, "rb"),
+                filename=DB_PATH,
+                caption="🗂️ نسخة احتياطية لقاعدة البيانات (SQLite).",
+                reply_markup=MAIN_KB,
+            )
+        else:
+            await update.message.reply_text("ماكو قاعدة بيانات بعد. أرشف أول ملف حتى تنخلق ✅", reply_markup=MAIN_KB)
+        return
+
+    # ===== Choosing subject =====
+    if text.startswith("📘 "):
+        subject = text.replace("📘 ", "").strip()
+        if subject not in SUBJECTS:
+            subject = "Other"
+        context.user_data["subject"] = subject
+        set_mode(context, "subject_home")
+        await update.message.reply_text(
+            f"📘 *{subject}*\nشنو تريد تسوي؟",
+            reply_markup=subject_actions_keyboard(subject),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # ===== Subject actions =====
+    if mode == "subject_home":
+        subject = current_subject(context) or "Other"
+
+        if text == "📤 أرشفة ملف جديد":
+            set_mode(context, "awaiting_file")
+            await update.message.reply_text(
+                f"تمام ✅\n"
+                f"المادة الحالية: *{subject}*\n\n"
+                "ارسل الآن ملف/صورة/PDF…\n"
+                "✍️ الأفضل تكتب وصف بالكابشن مثل:\n"
+                "`Unit 1 - Handout` أو `محاضرة 2`",
+                reply_markup=ReplyKeyboardMarkup([[KeyboardButton("⬅️ رجوع")]], resize_keyboard=True),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        if text == "📂 عرض ملفات المادة":
+            # نخلي وضع "عرض مادة" حتى الرقم يرسل الملف مباشرة
+            set_mode(context, "subject_browsing")
+            context.user_data["browse_subject"] = subject
+            context.user_data["browse_offset"] = 0
+            context.user_data["browse_page_size"] = DEFAULT_PAGE_SIZE
+            await send_subject_files_list(update, context, subject, 0, DEFAULT_PAGE_SIZE)
+            return
+
+        # أي شي غير معروف داخل subject_home
+        await update.message.reply_text("اختَر أحد الخيارين من الأزرار ✅", reply_markup=subject_actions_keyboard(subject))
+        return
+
+    # ===== Search mode =====
+    if mode == "search_waiting":
+        q = text
+        rows = search_files(update.effective_user.id, q, 20)
+        set_mode(context, "idle")
+        if not rows:
+            await update.message.reply_text(f"ما لقيت شي عن: *{q}*", reply_markup=MAIN_KB, parse_mode=ParseMode.MARKDOWN)
+            return
+        msg = f"🔎 *نتائج البحث عن:* `{q}`\n\n" + "\n".join(pretty_row_short(r) for r in rows)
+        msg += "\n\n✳️ لإرسال ملف: اكتب رقم الأرشفة مثل `12`."
+        await update.message.reply_text(msg, reply_markup=MAIN_KB, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # ===== If user typed an ID number to fetch file =====
+    # نسمح بها بأي وقت تقريباً
+    cleaned = text.replace("#", "").strip()
+    if cleaned.isdigit():
+        rid = int(cleaned)
+        rec = get_file_record(update.effective_user.id, rid)
+        if not rec:
+            await update.message.reply_text("ما لقيت هذا الرقم عندك 🤷‍♂️\nتأكد من رقم الأرشفة.", reply_markup=MAIN_KB)
+            return
+
+        _, _, chat_id, message_id, subject, ftype, cap, created, is_fav = rec
+        # نعيد إرسال الملف الأصلي
+        await context.bot.copy_message(
+            chat_id=update.effective_chat.id,
+            from_chat_id=chat_id,
+            message_id=message_id,
+        )
+
+        await update.message.reply_text(
+            f"✅ هذا ملفك\n"
+            f"📘 المادة: {subject}\n"
+            f"🧾 الوصف: {cap or 'بدون وصف'}\n"
+            f"🆔 رقم الأرشفة: #{rid}",
+            reply_markup=inline_fav_keyboard(rid, is_fav),
+        )
+        return
+
+    # ===== fallback =====
     await update.message.reply_text(
-        "أنا وياك، بس خلّينا نمشي بالنظام 😄\n"
-        "اختَر من الأزرار أو اكتب /help",
+        "أريد أمشي وياك بنظام 😄\nاختَر من الأزرار أو اكتب رقم ملف (#12) حتى أرسله لك.",
         reply_markup=MAIN_KB,
     )
 
-
-# =========================
-# File Handler
-# =========================
+# =======================
+# File Handler (archiving)
+# =======================
 async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if get_mode(context) != "awaiting_file":
+        await update.message.reply_text(
+            "حتى أؤرشف صح ✅\n"
+            "اختَر مادة أولاً: 📚 المواد → ثم 📤 أرشفة ملف جديد",
+            reply_markup=MAIN_KB,
+        )
+        return
+
+    subject = current_subject(context) or "Other"
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     message_id = update.message.message_id
     caption = (update.message.caption or "").strip()
 
-    # ذكي: إذا ما مختار مادة، نحاول نستنتجها من الكابشن
-    subject = context.user_data.get("subject")
-    if not subject:
-        guessed = detect_subject_from_caption(caption)
-        if guessed:
-            subject = guessed
-            context.user_data["subject"] = subject
-            context.user_data["awaiting_file"] = True
-
-    if not is_archive_mode(context) and not subject:
-        await update.message.reply_text(
-            "حتى أؤرشف صح ✅\n"
-            "اختر مادة أولاً من 📚 المواد\n"
-            "أو اكتب بالكابشن بدايةً اسم المادة مثل:\n"
-            "Grammar - Unit 1",
-            reply_markup=MAIN_KB,
-        )
-        return
-
-    subject = subject or "Other"
-
-    # Extract file
     file_type = None
     file_id = None
     file_unique_id = None
@@ -449,97 +549,90 @@ async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_id = update.message.voice.file_id
         file_unique_id = update.message.voice.file_unique_id
     else:
-        await update.message.reply_text("هذا النوع حالياً ما أدعمه. أرسل ملف/صورة/فيديو/صوت ✅", reply_markup=MAIN_KB)
+        await update.message.reply_text("هذا النوع حالياً ما أدعمه. أرسل PDF/صورة/فيديو/صوت ✅")
         return
 
-    try:
-        row_id = insert_file(
-            user_id=user_id,
-            chat_id=chat_id,
-            message_id=message_id,
-            subject=subject,
-            file_type=file_type,
-            file_id=file_id,
-            file_unique_id=file_unique_id,
-            caption=caption,
-        )
-    except Exception as e:
-        log.exception("DB insert failed: %s", e)
-        await update.message.reply_text("صار خطأ وأنا أخزّن البيانات 😅\nجرّب مرة ثانية.", reply_markup=MAIN_KB)
-        return
-
-    await update.message.reply_text(
-        "✅ تمّت الأرشفة بنجاح!\n\n"
-        f"📚 المادة: {subject}\n"
-        f"📦 النوع: {file_type}\n"
-        f"🆔 رقم الأرشفة: #{row_id}\n"
-        f"📝 الوصف: {caption or '—'}\n\n"
-        "تحب أخليه ⭐ مفضلة؟",
-        reply_markup=inline_fav_kb(row_id),
+    row_id = insert_file(
+        user_id=user_id,
+        chat_id=chat_id,
+        message_id=message_id,
+        subject=subject,
+        file_type=file_type,
+        file_id=file_id,
+        file_unique_id=file_unique_id,
+        caption=caption,
     )
 
+    # بعد الأرشفة نرجعك لقائمة المادة
+    set_mode(context, "subject_home")
+    await update.message.reply_text(
+        "✅ *تمت الأرشفة بنجاح!*\n"
+        f"📘 المادة: *{subject}*\n"
+        f"📦 النوع: `{file_type}`\n"
+        f"🆔 رقم الأرشفة: `#{row_id}`\n"
+        f"🧾 الوصف: {caption or 'بدون وصف'}\n\n"
+        "تريد تعرض ملفات المادة؟ اضغط *📂 عرض ملفات المادة*",
+        reply_markup=subject_actions_keyboard(subject),
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
-# =========================
-# Callback Handler
-# =========================
+# =======================
+# Callback Handler (fav + subject list nav)
+# =======================
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    data = (q.data or "")
     await q.answer()
 
-    data = (q.data or "")
+    # fav toggle
     if data.startswith("fav:"):
         _, rid, val = data.split(":")
         rid_i = int(rid)
         val_i = int(val)
+        set_fav(update.effective_user.id, rid_i, val_i)
 
+        # نقرأ السجل حتى نعرف الحالة الجديدة
+        rec = get_file_record(update.effective_user.id, rid_i)
+        is_fav = rec[-1] if rec else val_i
+
+        # نحدّث أزرار الرسالة (بدون تغيير النص كثير)
         try:
-            set_fav(update.effective_user.id, rid_i, val_i)
-        except Exception as e:
-            log.exception("Set fav failed: %s", e)
-            await q.edit_message_text("صار خطأ وأنا أحدّث المفضلة 😅")
-            return
+            await q.edit_message_reply_markup(reply_markup=inline_fav_keyboard(rid_i, is_fav))
+        except Exception:
+            pass
+        return
 
-        if val_i == 1:
-            await q.edit_message_text((q.message.text or "") + "\n\n⭐ تمت الإضافة للمفضلة.")
-        else:
-            await q.edit_message_text((q.message.text or "") + "\n\n☆ تمت الإزالة من المفضلة.")
+    # subject files navigation
+    if data.startswith("subnav:"):
+        _, subject, offset, page_size = data.split(":")
+        subject = subject.strip()
+        offset = int(offset)
+        page_size = int(page_size)
 
+        # نعرض نفس الرسالة بصفحة جديدة
+        await send_subject_files_list(q, context, subject, offset, page_size)
+        return
 
-# =========================
-# Error Handler
-# =========================
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.exception("Unhandled error: %s", context.error)
-    try:
-        if isinstance(update, Update) and update.effective_message:
-            await update.effective_message.reply_text("صار خطأ غير متوقع 😅\nبس تمام… أنا أسجّل التفاصيل وأرجع.", reply_markup=MAIN_KB)
-    except Exception:
-        pass
-
-
-# =========================
+# =======================
 # Main
-# =========================
+# =======================
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing. Set it as an environment variable.")
+        raise RuntimeError("BOT_TOKEN is missing. Set it as an environment variable (BOT_TOKEN).")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Commands
+    # commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("menu", menu))
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CommandHandler("status", status))
 
-    # Callbacks
+    # callbacks
     app.add_handler(CallbackQueryHandler(on_callback))
 
-    # Text menus
+    # text menus
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_text))
 
-    # Files
+    # file uploads
     app.add_handler(
         MessageHandler(
             filters.Document.ALL
@@ -551,12 +644,8 @@ def main():
         )
     )
 
-    # Global error handler
-    app.add_error_handler(on_error)
-
-    log.info("Bot started. DB=%s", DB_PATH)
-    app.run_polling()
-
+    print("Bot is running...")
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
