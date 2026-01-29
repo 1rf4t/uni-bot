@@ -238,29 +238,45 @@ def search_files(user_id: int, q: str, limit: int = 30):
 # UI Helpers
 # =========================
 def subjects_keyboard(user_id: int):
+    """
+    ✅ تعديل الشكل: قائمة المواد عمودين (2 أزرار بكل صف)
+    """
     counts = dict(count_by_subject(user_id))
-    buttons = []
+
+    items = []
     for s in SUBJECTS:
         emoji = SUBJECT_EMOJI.get(s, "📘")
         cnt = counts.get(s, 0)
-        # callback_data قصير ومضمون
-        buttons.append([InlineKeyboardButton(f"{emoji} {s} ({cnt})", callback_data=f"subj:{s}")])
+        items.append(InlineKeyboardButton(f"{emoji} {s} ({cnt})", callback_data=f"subj:{s}"))
+
+    buttons = []
+    for i in range(0, len(items), 2):
+        buttons.append(items[i:i+2])
 
     buttons.append([InlineKeyboardButton("↩️ رجوع", callback_data="back:home")])
     return InlineKeyboardMarkup(buttons)
 
 
 def files_keyboard(subject: str, rows):
-    # rows: sqlite rows with id, filename, caption...
-    buttons = []
+    """
+    ✅ تعديل الشكل: قائمة ملفات المادة عمودين + قص الاسم الطويل
+    """
+    items = []
     for r in rows:
         fid = int(r["id"])
         name = (r["filename"] or "").strip()
         if not name:
-            # fallback
             name = r["caption"] or f"file_{fid}"
-        # ✅ أهم تعديل: callback_data فقط ID قصير
-        buttons.append([InlineKeyboardButton(f"📄 {name}", callback_data=f"open:{fid}")])
+
+        clean = name.replace("\n", " ").strip()
+        if len(clean) > 26:
+            clean = clean[:23] + "…"
+
+        items.append(InlineKeyboardButton(f"📄 {clean}", callback_data=f"open:{fid}"))
+
+    buttons = []
+    for i in range(0, len(items), 2):
+        buttons.append(items[i:i+2])
 
     buttons.append([InlineKeyboardButton("↩️ رجوع للمواد", callback_data="back:subjects")])
     return InlineKeyboardMarkup(buttons)
@@ -314,7 +330,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def normalize_subject(text: str):
     t = text.strip()
-    # مطابقة حساسة/غير حساسة
     for s in SUBJECTS:
         if t.lower() == s.lower():
             return s
@@ -333,8 +348,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("🔎 ما لقيت نتائج.", reply_markup=MAIN_KB)
             return
         msg = "🔎 نتائج البحث:\n\n" + "\n".join(pretty_file_line(r) for r in rows)
-        # كل نتيجة نقدر نخليها قابلة للفتح بزر؟ (اختصار)
-        # هنا نخليها أرقام: المستخدم يضغط مواد ويفتح
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=MAIN_KB)
         return
 
@@ -368,7 +381,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "📦 نسخة احتياطية":
-        # نسخة احتياطية بسيطة: نسخ ملف DB
         try:
             backup_name = f"archive_backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.db"
             with open(DB_PATH, "rb") as f:
@@ -396,7 +408,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # أي نص غير مفهوم
     await update.message.reply_text("ما فهمت 😅\nاضغط من القائمة: 📚 المواد أو اكتب اسم المادة لتثبيتها.", reply_markup=MAIN_KB)
 
 
@@ -414,7 +425,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     subj = get_fixed_subject(context)
     if not subj:
-        # اطلب منه يختار مادة
         kb = subjects_keyboard(user_id)
         await update.message.reply_text("👇 اختر مادة أولاً لحفظ الملف:", reply_markup=kb)
         return
@@ -422,7 +432,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     caption = (msg.caption or "").strip() or None
 
-    # تحديد نوع الملف و file_id
     file_type = None
     tg_file_id = None
     filename = None
@@ -486,11 +495,6 @@ async def cb_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cb_open_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    ✅ هذا أهم إصلاح:
-    callback_data = open:<ID>
-    فتح مضمون لأن الـ ID قصير ولا يتجاوز 64 بايت.
-    """
     query = update.callback_query
     await query.answer()
 
@@ -508,7 +512,6 @@ async def cb_open_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = row["caption"] or None
     is_fav = int(row["is_fav"])
 
-    # أرسل الملف نفسه (هذا هو "الفتح")
     if row["file_type"] == "document":
         await query.message.reply_document(document=row["tg_file_id"], caption=caption or filename)
     elif row["file_type"] == "photo":
@@ -523,7 +526,6 @@ async def cb_open_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("⚠️ نوع الملف غير مدعوم.")
         return
 
-    # رسالة إدارة ملف (مثل اللي عندك)
     await query.message.reply_text(
         f"⚙️ <b>إدارة الملف</b>:\n{emoji} {subj} | #{file_id}\n📄 {filename}",
         parse_mode=ParseMode.HTML,
@@ -564,7 +566,6 @@ async def cb_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("❌ الملف غير موجود.")
         return
 
-    # حذف من قاعدة البيانات فقط (لا يحذف من تيليجرام نفسه)
     delete_file(user_id, file_id)
     await query.message.reply_text("🗑️ تم حذف الملف من أرشيفك.")
 
@@ -595,13 +596,18 @@ def main():
 
     # callbacks
     app.add_handler(CallbackQueryHandler(cb_subject, pattern=r"^subj:"))
-    app.add_handler(CallbackQueryHandler(cb_open_file, pattern=r"^open:\d+$"))  # ✅ الإصلاح الأساسي
+    app.add_handler(CallbackQueryHandler(cb_open_file, pattern=r"^open:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_fav, pattern=r"^fav:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_del, pattern=r"^del:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_back, pattern=r"^back:"))
 
     # messages
-    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE, handle_file))
+    app.add_handler(
+        MessageHandler(
+            filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE,
+            handle_file,
+        )
+    )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     print("Bot is running...")
