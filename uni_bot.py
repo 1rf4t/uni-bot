@@ -39,10 +39,16 @@ FILES_DIR = os.getenv("FILES_DIR", "/data/files").strip()
 BACKUP_DIR = os.getenv("BACKUP_DIR", "/data/backups").strip()
 
 # نسخة Seed (اختياري) إذا تريد ترجع بيانات أول مرة
-SEED_DB_PATH = os.getenv("SEED_DB_PATH", "").strip()  # مثال: "archive_backup_20260129_010615.db"
+SEED_DB_PATH = os.getenv("SEED_DB_PATH", "").strip()  # مثال: "/app/archive_backup_20260129_010615.db"
 
-# Admins / Owner
+# Admins / Owner (هذا الشخص يتعامل كأدمن، وتروح له النسخ الاحتياطية)
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+
+# ✅ NEW: LIBRARY OWNER (هوية المكتبة داخل الـ DB)
+# إذا ما محددها، نخليها تتحدد لاحقاً تلقائياً من محتوى الـ DB
+LIBRARY_ID_ENV = os.getenv("LIBRARY_ID", "").strip()  # optional
+LIBRARY_ID = int(LIBRARY_ID_ENV) if LIBRARY_ID_ENV.isdigit() else 0  # will be auto-detected if 0
+
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()  # "123,456"
 ADMIN_IDS = set()
 if ADMIN_IDS_RAW:
@@ -184,6 +190,44 @@ def seed_db_if_needed():
     seed = Path(SEED_DB_PATH)
     if seed.exists() and seed.is_file() and seed.stat().st_size > 10_000:
         shutil.copy2(str(seed), DB_PATH)
+
+# ✅ NEW: detect library id from DB content
+def detect_library_id() -> int:
+    """
+    يرجع user_id اللي فعلاً عنده ملفات داخل الـ DB (غير محذوفة).
+    - لو OWNER_ID عنده ملفات => يرجعه
+    - إذا لا، يرجع أول user_id الأكثر ملفات
+    - إذا DB فارغ => 0
+    """
+    try:
+        con = db()
+        cur = con.cursor()
+
+        # if OWNER_ID already has rows, use it
+        if OWNER_ID:
+            cur.execute("SELECT COUNT(*) FROM files WHERE user_id=? AND is_deleted=0", (OWNER_ID,))
+            if cur.fetchone()[0] > 0:
+                con.close()
+                return OWNER_ID
+
+        # otherwise pick the user_id with most files
+        cur.execute(
+            """
+            SELECT user_id, COUNT(*) AS cnt
+            FROM files
+            WHERE is_deleted=0
+            GROUP BY user_id
+            ORDER BY cnt DESC
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+        con.close()
+        if row:
+            return int(row[0])
+        return 0
+    except Exception:
+        return 0
 
 def add_file_row(user_id: int, subject: str, file_type: str, tg_file_id: str,
                  filename: str | None, caption: str | None, local_path: str | None):
@@ -463,7 +507,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = "👑 Admin" if is_admin(uid) else "👀 Viewer"
     text = (
         f"يا هلا 👋\n"
-        f"وضعك الحالي: <b>{role}</b>\n\n"
+        f"وضعك الحالي: <b>{role}</b>\n"
+        f"LIBRARY_ID: <code>{LIBRARY_ID}</code>\n\n"
         "📚 هذا بوت أرشفة للجامعة.\n"
         "• الطلاب: تصفّح فقط.\n"
         "• الأدمن: يضيف/يحذف/يسوي Backup.\n\n"
@@ -492,6 +537,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• اكتب اسم المادة ثم ارسل ملفات لإضافتها.\n"
             "• /restore_latest لاسترجاع DB من آخر Backup على السيرفر.\n"
             "• /purge_trash تنظيف سلة المحذوفات.\n"
+            "• /library عرض LIBRARY_ID الحالي.\n"
+            "• /adopt_library تبنّي المكتبة تلقائياً من DB (إذا مختلف).\n"
         )
     else:
         msg += "👀 أنت Viewer: تقدر تشوف وتفتح الملفات فقط."
@@ -513,7 +560,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Search mode
     if context.user_data.get("search_mode"):
         context.user_data["search_mode"] = False
-        rows = search_files(OWNER_ID, text)
+        rows = search_files(LIBRARY_ID, text)
         if not rows:
             await update.message.reply_text("🔎 ماكو نتائج.", reply_markup=MAIN_KB)
             return
@@ -522,12 +569,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "📚 المواد":
-        kb = subjects_keyboard(OWNER_ID)
+        kb = subjects_keyboard(LIBRARY_ID)
         await update.message.reply_text("📚 المواد:\n👇 اضغط مادة", reply_markup=kb)
         return
 
     if text == "🧾 آخر الملفات":
-        rows = list_recent(OWNER_ID, 12)
+        rows = list_recent(LIBRARY_ID, 12)
         if not rows:
             await update.message.reply_text("ماكو أرشيف بعد.", reply_markup=MAIN_KB)
             return
@@ -536,7 +583,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "⭐ المفضلة":
-        rows = list_favorites(OWNER_ID, 50)
+        rows = list_favorites(LIBRARY_ID, 50)
         if not rows:
             await update.message.reply_text("⭐ ماكو مفضلة بعد.", reply_markup=MAIN_KB)
             return
@@ -643,7 +690,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         local_path = None
 
     new_id = add_file_row(
-        user_id=OWNER_ID,
+        user_id=LIBRARY_ID,
         subject=subj,
         file_type=file_type,
         tg_file_id=tg_file_id,
@@ -668,7 +715,7 @@ async def cb_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     subject = query.data.split(":", 1)[1]
-    rows = list_files_by_subject(OWNER_ID, subject, 50)
+    rows = list_files_by_subject(LIBRARY_ID, subject, 50)
     emoji = SUBJECT_EMOJI.get(subject, "📘")
 
     if not rows:
@@ -685,7 +732,7 @@ async def cb_open_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = query.from_user.id
     file_id = int(query.data.split(":", 1)[1])
 
-    row = get_file_by_id(OWNER_ID, file_id)
+    row = get_file_by_id(LIBRARY_ID, file_id)
     if not row or int(row["is_deleted"]) == 1:
         await query.message.reply_text("❌ الملف غير موجود أو محذوف.")
         return
@@ -759,13 +806,13 @@ async def cb_fav(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     file_id = int(query.data.split(":", 1)[1])
-    row = get_file_by_id(OWNER_ID, file_id)
+    row = get_file_by_id(LIBRARY_ID, file_id)
     if not row:
         await query.message.reply_text("❌ الملف غير موجود.")
         return
 
     new_fav = 0 if int(row["is_fav"]) else 1
-    set_fav(OWNER_ID, file_id, new_fav)
+    set_fav(LIBRARY_ID, file_id, new_fav)
     await query.message.reply_text("⭐ تم تحديث المفضلة.")
 
 async def cb_del_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -778,7 +825,7 @@ async def cb_del_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     file_id = int(query.data.split(":", 1)[1])
-    row = get_file_by_id(OWNER_ID, file_id)
+    row = get_file_by_id(LIBRARY_ID, file_id)
     if not row:
         await query.message.reply_text("❌ الملف غير موجود.")
         return
@@ -799,7 +846,7 @@ async def cb_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     file_id = int(query.data.split(":", 1)[1])
-    soft_delete_file(OWNER_ID, file_id)
+    soft_delete_file(LIBRARY_ID, file_id)
     await query.message.reply_text("🗑️ تم نقل الملف إلى السلة (Soft Delete).")
 
 async def cb_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -812,7 +859,7 @@ async def cb_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     file_id = int(query.data.split(":", 1)[1])
-    restore_file(OWNER_ID, file_id)
+    restore_file(LIBRARY_ID, file_id)
     await query.message.reply_text("♻️ تم استرجاع الملف.")
 
 async def cb_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -820,7 +867,7 @@ async def cb_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     where = query.data.split(":", 1)[1]
     if where == "subjects":
-        kb = subjects_keyboard(OWNER_ID)
+        kb = subjects_keyboard(LIBRARY_ID)
         await query.message.reply_text("📚 المواد:\n👇 اضغط مادة", reply_markup=kb)
     else:
         await query.message.reply_text("✅", reply_markup=MAIN_KB)
@@ -836,12 +883,17 @@ async def restore_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = restore_from_latest_backup()
     await update.message.reply_text(msg)
 
+    # بعد الاسترجاع، حاول نحدد المكتبة من جديد (إذا LIBRARY_ID مو محدد بالENV)
+    global LIBRARY_ID
+    if LIBRARY_ID == 0:
+        LIBRARY_ID = detect_library_id()
+
 async def purge_trash_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_admin(uid):
         await update.message.reply_text("⛔ للأدمن فقط.")
         return
-    purge_trash(OWNER_ID)
+    purge_trash(LIBRARY_ID)
     await update.message.reply_text("✅ تم تنظيف السلة حسب مدة الاحتفاظ.")
 
 async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -862,8 +914,40 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Admins: {len(ADMIN_IDS)}\n"
         f"• Auto backup: {AUTO_BACKUP_MINUTES} min\n"
         f"• Silent backup: {'✅' if SILENT_BACKUP_TO_OWNER else '❌'}\n"
+        f"• LIBRARY_ID: {LIBRARY_ID}\n"
+        f"• OWNER_ID: {OWNER_ID}\n"
     )
     await update.message.reply_text(msg)
+
+# ✅ NEW: show current library id
+async def library_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ للأدمن فقط.")
+        return
+    await update.message.reply_text(f"📚 LIBRARY_ID الحالي: <code>{LIBRARY_ID}</code>", parse_mode=ParseMode.HTML)
+
+# ✅ NEW: adopt library automatically from DB
+async def adopt_library(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ للأدمن فقط.")
+        return
+
+    global LIBRARY_ID
+    detected = detect_library_id()
+    if detected == 0:
+        await update.message.reply_text("❌ DB فارغ أو ماكو ملفات حتى نحدد LIBRARY_ID.")
+        return
+
+    old = LIBRARY_ID
+    LIBRARY_ID = detected
+
+    await update.message.reply_text(
+        "✅ تم تبنّي المكتبة تلقائياً.\n"
+        f"• old LIBRARY_ID: {old}\n"
+        f"• new LIBRARY_ID: {LIBRARY_ID}"
+    )
 
 # ============================================================
 # MAIN
@@ -872,6 +956,14 @@ def main():
     ensure_dirs()
     seed_db_if_needed()
     init_db()
+
+    # ✅ Auto-detect library id if not provided
+    global LIBRARY_ID
+    if LIBRARY_ID == 0:
+        LIBRARY_ID = detect_library_id()
+        # fallback: if still 0, default to OWNER_ID (empty library case)
+        if LIBRARY_ID == 0 and OWNER_ID:
+            LIBRARY_ID = OWNER_ID
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -890,6 +982,10 @@ def main():
     app.add_handler(CommandHandler("restore_latest", restore_latest))
     app.add_handler(CommandHandler("purge_trash", purge_trash_cmd))
     app.add_handler(CommandHandler("health", health))
+
+    # ✅ NEW commands
+    app.add_handler(CommandHandler("library", library_cmd))
+    app.add_handler(CommandHandler("adopt_library", adopt_library))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(cb_subject, pattern=r"^subj:"))
