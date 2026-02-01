@@ -26,7 +26,7 @@ from telegram.ext import (
 # CONFIG
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DB_PATH = os.getenv("DB_PATH", "archive.db")
+DB_PATH = os.getenv("DB_PATH", "archive_backup_20260129_010615.db")
 
 if not BOT_TOKEN:
     raise SystemExit("❌ BOT_TOKEN غير مضبوط. استخدم: export BOT_TOKEN='xxxxx'")
