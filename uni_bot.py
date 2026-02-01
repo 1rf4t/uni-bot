@@ -57,6 +57,9 @@ if OWNER_ID:
 AUTO_BACKUP_MINUTES = int(os.getenv("AUTO_BACKUP_MINUTES", "60"))
 BACKUP_KEEP = int(os.getenv("BACKUP_KEEP", "30"))
 
+# ✅ NEW: Silent auto-backup toggle
+SILENT_BACKUP_TO_OWNER = os.getenv("SILENT_BACKUP_TO_OWNER", "false").strip().lower() == "true"
+
 # Delete / Trash
 TRASH_RETENTION_DAYS = int(os.getenv("TRASH_RETENTION_DAYS", "30"))
 
@@ -147,7 +150,7 @@ def init_db():
             tg_file_id TEXT NOT NULL,
             filename TEXT,
             caption TEXT,
-            local_path TEXT,              -- ✅ الملف محفوظ فعليًا هنا
+            local_path TEXT,
             added_at TEXT NOT NULL,
             is_fav INTEGER NOT NULL DEFAULT 0,
             is_deleted INTEGER NOT NULL DEFAULT 0,
@@ -174,14 +177,12 @@ def db_has_data() -> bool:
         return False
 
 def seed_db_if_needed():
-    # إذا ما عندك Seed أو DB عندك فيها بيانات، تجاهل
     if not SEED_DB_PATH:
         return
     if db_has_data():
         return
     seed = Path(SEED_DB_PATH)
     if seed.exists() and seed.is_file() and seed.stat().st_size > 10_000:
-        # فقط إذا DB غير موجودة أو فاضية فعلاً
         shutil.copy2(str(seed), DB_PATH)
 
 def add_file_row(user_id: int, subject: str, file_type: str, tg_file_id: str,
@@ -324,10 +325,6 @@ def search_files(user_id: int, q: str, limit: int = 30):
     return rows
 
 def purge_trash(user_id: int):
-    """
-    يحذف نهائيًا الملفات المحذوفة من فترة طويلة
-    (لا يحذف الـ local file هنا، فقط سجل DB لتجنب كوارث)
-    """
     cutoff = datetime.utcnow() - timedelta(days=TRASH_RETENTION_DAYS)
     con = db()
     cur = con.cursor()
@@ -376,23 +373,28 @@ async def send_backup_to_owner(context: ContextTypes.DEFAULT_TYPE, backup_path: 
                 caption=caption,
             )
     except Exception:
-        # لا نكسر البوت إذا فشل الإرسال
         pass
 
 async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    ✅ Auto-backup
+    - Always creates backup file in BACKUP_DIR
+    - If SILENT_BACKUP_TO_OWNER=true => no Telegram message/file is sent
+    """
     try:
         backup_name = make_backup_name()
         backup_path = Path(BACKUP_DIR) / backup_name
         make_sqlite_backup(str(backup_path))
         cleanup_old_backups()
-        await send_backup_to_owner(context, backup_path, "✅ Auto-backup (DB)")
+
+        # ✅ Silent mode
+        if not SILENT_BACKUP_TO_OWNER:
+            await send_backup_to_owner(context, backup_path, "✅ Auto-backup (DB)")
+
     except Exception:
         pass
 
 def restore_from_latest_backup() -> str:
-    """
-    يسترجع قاعدة البيانات من آخر Backup داخل BACKUP_DIR
-    """
     bdir = Path(BACKUP_DIR)
     files = sorted(bdir.glob("archive_backup_*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not files:
@@ -433,7 +435,6 @@ def files_keyboard(subject: str, rows):
     return InlineKeyboardMarkup(buttons)
 
 def manage_keyboard_admin(file_id: int, is_fav: int, is_deleted: int):
-    # Admin only
     fav_btn = InlineKeyboardButton("⭐ إزالة من المفضلة" if is_fav else "⭐ إضافة للمفضلة", callback_data=f"fav:{file_id}")
     if is_deleted:
         restore_btn = InlineKeyboardButton("♻️ استرجاع", callback_data=f"restore:{file_id}")
@@ -512,7 +513,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Search mode
     if context.user_data.get("search_mode"):
         context.user_data["search_mode"] = False
-        rows = search_files(OWNER_ID, text)  # ✅ كل الناس تشوف أرشيف OWNER فقط
+        rows = search_files(OWNER_ID, text)
         if not rows:
             await update.message.reply_text("🔎 ماكو نتائج.", reply_markup=MAIN_KB)
             return
@@ -520,9 +521,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=MAIN_KB)
         return
 
-    # Buttons
     if text == "📚 المواد":
-        kb = subjects_keyboard(OWNER_ID)  # ✅ الكل يشوف أرشيف OWNER
+        kb = subjects_keyboard(OWNER_ID)
         await update.message.reply_text("📚 المواد:\n👇 اضغط مادة", reply_markup=kb)
         return
 
@@ -550,7 +550,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "📦 نسخة احتياطية":
-        # Viewer يقدر يطلب؟ الأفضل لا — نخليها للأدمن فقط
         if not is_admin(uid):
             await update.message.reply_text("⛔ النسخ الاحتياطي للأدمن فقط.", reply_markup=MAIN_KB)
             return
@@ -569,7 +568,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await help_cmd(update, context)
         return
 
-    # Fix subject (Admin only)
     subj = normalize_subject(text)
     if subj:
         if not is_admin(uid):
@@ -630,8 +628,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ نوع غير مدعوم.", reply_markup=MAIN_KB)
         return
 
-    # ✅ حفظ الملف فعليًا على السيرفر
-    # مسار: /data/files/<subject>/<timestamp>_<filename>
     emoji = SUBJECT_EMOJI.get(subj, "📘")
     subject_dir = Path(FILES_DIR) / subj
     subject_dir.mkdir(parents=True, exist_ok=True)
@@ -644,11 +640,10 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tg_file = await context.bot.get_file(tg_file_id)
         await tg_file.download_to_drive(custom_path=str(local_path))
     except Exception:
-        # إذا فشل التحميل، نخزن سجل بدون local_path ونستخدم tg_file_id فقط
         local_path = None
 
     new_id = add_file_row(
-        user_id=OWNER_ID,               # ✅ نخزن كل الملفات تحت مالك البوت (مكتبة عامة)
+        user_id=OWNER_ID,
         subject=subj,
         file_type=file_type,
         tg_file_id=tg_file_id,
@@ -701,7 +696,6 @@ async def cb_open_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     local_path = row["local_path"]
     sent = False
 
-    # ✅ الأفضل: من التخزين المحلي
     if local_path:
         p = Path(local_path)
         if p.exists() and p.is_file():
@@ -725,7 +719,6 @@ async def cb_open_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 sent = False
 
-    # خطة B: من تيليجرام
     if not sent:
         try:
             ft = row["file_type"]
@@ -747,7 +740,6 @@ async def cb_open_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"❌ تعذر إرسال الملف: {e}")
             return
 
-    # إدارة: أدمن فقط
     if is_admin(uid):
         await query.message.reply_text(
             f"⚙️ <b>إدارة</b> | #{file_id}",
@@ -791,7 +783,6 @@ async def cb_del_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("❌ الملف غير موجود.")
         return
 
-    # تأكيد أول
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ نعم احذف", callback_data=f"del:{file_id}"),
          InlineKeyboardButton("❌ تراجع", callback_data="back:subjects")]
@@ -870,6 +861,7 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Backups dir: {'✅' if p_bak.exists() else '❌'}\n"
         f"• Admins: {len(ADMIN_IDS)}\n"
         f"• Auto backup: {AUTO_BACKUP_MINUTES} min\n"
+        f"• Silent backup: {'✅' if SILENT_BACKUP_TO_OWNER else '❌'}\n"
     )
     await update.message.reply_text(msg)
 
@@ -878,10 +870,7 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 def main():
     ensure_dirs()
-
-    # Seed only if DB empty
     seed_db_if_needed()
-
     init_db()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
