@@ -3,6 +3,7 @@
 
 import os
 import sqlite3
+import shutil
 from datetime import datetime
 
 from telegram import (
@@ -26,7 +27,16 @@ from telegram.ext import (
 # CONFIG
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DB_PATH = os.getenv("DB_PATH", "archive_backup_20260129_010615.db")
+
+# ✅ قاعدة البيانات لازم اسم ثابت (لا تستخدم اسم backup كقاعدة رئيسية)
+DB_PATH = os.getenv("DB_PATH", "archive.db")
+
+# ✅ حتى يرسل لك النسخ الاحتياطية تلقائياً
+# ضع رقم حسابك (Telegram user id) في Railway/الاستضافة كمتغير بيئة OWNER_ID
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+
+# ✅ كل كم دقيقة يسوي نسخة احتياطية تلقائية (مثلاً 60 = كل ساعة)
+AUTO_BACKUP_MINUTES = int(os.getenv("AUTO_BACKUP_MINUTES", "60"))
 
 if not BOT_TOKEN:
     raise SystemExit("❌ BOT_TOKEN غير مضبوط. استخدم: export BOT_TOKEN='xxxxx'")
@@ -235,6 +245,40 @@ def search_files(user_id: int, q: str, limit: int = 30):
 
 
 # =========================
+# AUTO BACKUP (NEW)
+# =========================
+def make_backup_name() -> str:
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    return f"archive_backup_{ts}.db"
+
+
+async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    # إذا ما محدد OWNER_ID لا نسوي شي
+    if OWNER_ID == 0:
+        return
+
+    try:
+        # نسخ القاعدة لملف backup جديد
+        backup_name = make_backup_name()
+        shutil.copy2(DB_PATH, backup_name)
+
+        # إرسال النسخة لصاحب البوت
+        with open(backup_name, "rb") as f:
+            await context.bot.send_document(
+                chat_id=OWNER_ID,
+                document=f,
+                filename=backup_name,
+                caption="✅ نسخة احتياطية تلقائية من قاعدة البيانات",
+            )
+    except Exception as e:
+        # نبلغك بالخطأ إذا صار شيء
+        try:
+            await context.bot.send_message(chat_id=OWNER_ID, text=f"❌ فشل النسخ الاحتياطي التلقائي: {e}")
+        except Exception:
+            pass
+
+
+# =========================
 # UI Helpers
 # =========================
 def subjects_keyboard(user_id: int):
@@ -251,7 +295,7 @@ def subjects_keyboard(user_id: int):
 
     buttons = []
     for i in range(0, len(items), 2):
-        buttons.append(items[i:i+2])
+        buttons.append(items[i:i + 2])
 
     buttons.append([InlineKeyboardButton("↩️ رجوع", callback_data="back:home")])
     return InlineKeyboardMarkup(buttons)
@@ -276,7 +320,7 @@ def files_keyboard(subject: str, rows):
 
     buttons = []
     for i in range(0, len(items), 2):
-        buttons.append(items[i:i+2])
+        buttons.append(items[i:i + 2])
 
     buttons.append([InlineKeyboardButton("↩️ رجوع للمواد", callback_data="back:subjects")])
     return InlineKeyboardMarkup(buttons)
@@ -323,7 +367,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• لتحفظ بسرعة: اكتب اسم المادة فقط ثم ابعث ملفات.\n"
         "• لفتح ملف: ادخل المادة واضغط اسم الملف من القائمة.\n"
         "• ⭐ المفضلة: ملفاتك المميزة.\n"
-        "• 🧾 آخر الملفات: آخر ما حفظته.\n",
+        "• 🧾 آخر الملفات: آخر ما حفظته.\n"
+        "• 📦 نسخة احتياطية: تسوي Backup يدوي وتوصلك.\n",
         reply_markup=MAIN_KB,
     )
 
@@ -380,11 +425,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔎 اكتب كلمة من اسم الملف أو الوصف:", reply_markup=MAIN_KB)
         return
 
+    # نسخة احتياطية يدوية (كما كانت عندك)
     if text == "📦 نسخة احتياطية":
         try:
             backup_name = f"archive_backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.db"
+
+            # ✅ نرسل لك نسخة من DB (نفس السابق)
             with open(DB_PATH, "rb") as f:
-                await update.message.reply_document(document=f, filename=backup_name, caption="📦 نسخة احتياطية من قاعدة البيانات")
+                await update.message.reply_document(
+                    document=f,
+                    filename=backup_name,
+                    caption="📦 نسخة احتياطية من قاعدة البيانات"
+                )
         except Exception as e:
             await update.message.reply_text(f"❌ فشل النسخ الاحتياطي: {e}")
         return
@@ -589,6 +641,15 @@ def main():
     init_db()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # ✅ جدولة النسخ الاحتياطي التلقائي
+    # يبدأ بعد دقيقة، ثم يكرر حسب AUTO_BACKUP_MINUTES
+    if AUTO_BACKUP_MINUTES > 0:
+        app.job_queue.run_repeating(
+            auto_backup_job,
+            interval=AUTO_BACKUP_MINUTES * 60,
+            first=60,
+        )
 
     # commands
     app.add_handler(CommandHandler("start", start))
