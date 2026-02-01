@@ -146,6 +146,7 @@ def init_db():
     con = db()
     cur = con.cursor()
 
+    # ✅ create table (new schema)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS files (
@@ -164,8 +165,27 @@ def init_db():
         );
         """
     )
+
+    # ✅ MIGRATION: دعم قواعد بيانات قديمة (بدون تخريب)
+    # إذا جدول files قديم وناقص أعمدة، نضيفها
+    try:
+        cur.execute("PRAGMA table_info(files)")
+        cols = {row[1] for row in cur.fetchall()}
+
+        if "local_path" not in cols:
+            cur.execute("ALTER TABLE files ADD COLUMN local_path TEXT")
+        if "is_fav" not in cols:
+            cur.execute("ALTER TABLE files ADD COLUMN is_fav INTEGER NOT NULL DEFAULT 0")
+        if "is_deleted" not in cols:
+            cur.execute("ALTER TABLE files ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
+        if "deleted_at" not in cols:
+            cur.execute("ALTER TABLE files ADD COLUMN deleted_at TEXT")
+    except Exception:
+        pass
+
     cur.execute("CREATE INDEX IF NOT EXISTS idx_files_user_subject ON files(user_id, subject);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_files_user_added ON files(user_id, added_at);")
+    # هذا الاندكس ما يضر حتى لو العمود جديد (المigration يضمن وجوده)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_files_deleted ON files(user_id, is_deleted);")
 
     con.commit()
@@ -191,7 +211,18 @@ def seed_db_if_needed():
     if seed.exists() and seed.is_file() and seed.stat().st_size > 10_000:
         shutil.copy2(str(seed), DB_PATH)
 
-# ✅ NEW: detect library id from DB content
+def _has_is_deleted_column() -> bool:
+    try:
+        con = db()
+        cur = con.cursor()
+        cur.execute("PRAGMA table_info(files)")
+        cols = {row[1] for row in cur.fetchall()}
+        con.close()
+        return "is_deleted" in cols
+    except Exception:
+        return False
+
+# ✅ detect library id from DB content (modern)
 def detect_library_id() -> int:
     """
     يرجع user_id اللي فعلاً عنده ملفات داخل الـ DB (غير محذوفة).
@@ -229,6 +260,75 @@ def detect_library_id() -> int:
     except Exception:
         return 0
 
+# ✅ legacy-safe detector (works even if DB is older)
+def detect_library_id_legacy() -> int:
+    """
+    نسخة احتياطية من detect_library_id
+    تشتغل حتى لو DB قديمة وما بيها is_deleted
+    """
+    try:
+        con = db()
+        cur = con.cursor()
+
+        cur.execute("PRAGMA table_info(files)")
+        cols = {row[1] for row in cur.fetchall()}
+        has_deleted = "is_deleted" in cols
+
+        # 1) إذا OWNER_ID عنده ملفات استخدمه
+        if OWNER_ID:
+            if has_deleted:
+                cur.execute("SELECT COUNT(*) FROM files WHERE user_id=? AND is_deleted=0", (OWNER_ID,))
+            else:
+                cur.execute("SELECT COUNT(*) FROM files WHERE user_id=?", (OWNER_ID,))
+            if cur.fetchone()[0] > 0:
+                con.close()
+                return OWNER_ID
+
+        # 2) غير ذلك: جيب أكثر user_id عنده ملفات
+        if has_deleted:
+            cur.execute("""
+                SELECT user_id, COUNT(*) AS cnt
+                FROM files
+                WHERE is_deleted=0
+                GROUP BY user_id
+                ORDER BY cnt DESC
+                LIMIT 1
+            """)
+        else:
+            cur.execute("""
+                SELECT user_id, COUNT(*) AS cnt
+                FROM files
+                GROUP BY user_id
+                ORDER BY cnt DESC
+                LIMIT 1
+            """)
+
+        row = cur.fetchone()
+        con.close()
+        if row:
+            return int(row[0])
+        return 0
+    except Exception:
+        return 0
+
+def library_has_any_files(user_id: int) -> bool:
+    try:
+        con = db()
+        cur = con.cursor()
+        cur.execute("PRAGMA table_info(files)")
+        cols = {row[1] for row in cur.fetchall()}
+        has_deleted = "is_deleted" in cols
+
+        if has_deleted:
+            cur.execute("SELECT COUNT(*) FROM files WHERE user_id=? AND is_deleted=0", (user_id,))
+        else:
+            cur.execute("SELECT COUNT(*) FROM files WHERE user_id=?", (user_id,))
+        n = cur.fetchone()[0]
+        con.close()
+        return n > 0
+    except Exception:
+        return False
+
 def add_file_row(user_id: int, subject: str, file_type: str, tg_file_id: str,
                  filename: str | None, caption: str | None, local_path: str | None):
     con = db()
@@ -248,10 +348,18 @@ def add_file_row(user_id: int, subject: str, file_type: str, tg_file_id: str,
 def count_by_subject(user_id: int):
     con = db()
     cur = con.cursor()
-    cur.execute(
-        "SELECT subject, COUNT(*) cnt FROM files WHERE user_id=? AND is_deleted=0 GROUP BY subject",
-        (user_id,),
-    )
+
+    if _has_is_deleted_column():
+        cur.execute(
+            "SELECT subject, COUNT(*) cnt FROM files WHERE user_id=? AND is_deleted=0 GROUP BY subject",
+            (user_id,),
+        )
+    else:
+        cur.execute(
+            "SELECT subject, COUNT(*) cnt FROM files WHERE user_id=? GROUP BY subject",
+            (user_id,),
+        )
+
     rows = cur.fetchall()
     con.close()
     return [(r[0], r[1]) for r in rows]
@@ -259,16 +367,30 @@ def count_by_subject(user_id: int):
 def list_files_by_subject(user_id: int, subject: str, limit: int = 50):
     con = db()
     cur = con.cursor()
-    cur.execute(
-        """
-        SELECT id, file_type, filename, caption, added_at, is_fav
-        FROM files
-        WHERE user_id=? AND subject=? AND is_deleted=0
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (user_id, subject, limit),
-    )
+
+    if _has_is_deleted_column():
+        cur.execute(
+            """
+            SELECT id, file_type, filename, caption, added_at, is_fav
+            FROM files
+            WHERE user_id=? AND subject=? AND is_deleted=0
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, subject, limit),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT id, file_type, filename, caption, added_at, is_fav
+            FROM files
+            WHERE user_id=? AND subject=?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, subject, limit),
+        )
+
     rows = cur.fetchall()
     con.close()
     return rows
@@ -298,6 +420,8 @@ def set_fav(user_id: int, file_id: int, fav: int):
 def soft_delete_file(user_id: int, file_id: int):
     con = db()
     cur = con.cursor()
+
+    # إذا DB قديمة وما بيها is_deleted، migration داخل init_db يضمن وجوده
     cur.execute(
         "UPDATE files SET is_deleted=1, deleted_at=? WHERE user_id=? AND id=?",
         (utcnow_str(), user_id, file_id),
@@ -318,16 +442,30 @@ def restore_file(user_id: int, file_id: int):
 def list_recent(user_id: int, limit: int = 10):
     con = db()
     cur = con.cursor()
-    cur.execute(
-        """
-        SELECT id, subject, file_type, filename, caption, added_at, is_fav
-        FROM files
-        WHERE user_id=? AND is_deleted=0
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (user_id, limit),
-    )
+
+    if _has_is_deleted_column():
+        cur.execute(
+            """
+            SELECT id, subject, file_type, filename, caption, added_at, is_fav
+            FROM files
+            WHERE user_id=? AND is_deleted=0
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT id, subject, file_type, filename, caption, added_at, is_fav
+            FROM files
+            WHERE user_id=?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        )
+
     rows = cur.fetchall()
     con.close()
     return rows
@@ -335,16 +473,30 @@ def list_recent(user_id: int, limit: int = 10):
 def list_favorites(user_id: int, limit: int = 50):
     con = db()
     cur = con.cursor()
-    cur.execute(
-        """
-        SELECT id, subject, file_type, filename, caption, added_at, is_fav
-        FROM files
-        WHERE user_id=? AND is_deleted=0 AND is_fav=1
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (user_id, limit),
-    )
+
+    if _has_is_deleted_column():
+        cur.execute(
+            """
+            SELECT id, subject, file_type, filename, caption, added_at, is_fav
+            FROM files
+            WHERE user_id=? AND is_deleted=0 AND is_fav=1
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT id, subject, file_type, filename, caption, added_at, is_fav
+            FROM files
+            WHERE user_id=? AND is_fav=1
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        )
+
     rows = cur.fetchall()
     con.close()
     return rows
@@ -353,17 +505,32 @@ def search_files(user_id: int, q: str, limit: int = 30):
     like = f"%{q}%"
     con = db()
     cur = con.cursor()
-    cur.execute(
-        """
-        SELECT id, subject, file_type, filename, caption, added_at, is_fav
-        FROM files
-        WHERE user_id=? AND is_deleted=0
-          AND (filename LIKE ? OR caption LIKE ?)
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (user_id, like, like, limit),
-    )
+
+    if _has_is_deleted_column():
+        cur.execute(
+            """
+            SELECT id, subject, file_type, filename, caption, added_at, is_fav
+            FROM files
+            WHERE user_id=? AND is_deleted=0
+              AND (filename LIKE ? OR caption LIKE ?)
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, like, like, limit),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT id, subject, file_type, filename, caption, added_at, is_fav
+            FROM files
+            WHERE user_id=?
+              AND (filename LIKE ? OR caption LIKE ?)
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, like, like, limit),
+        )
+
     rows = cur.fetchall()
     con.close()
     return rows
@@ -372,6 +539,8 @@ def purge_trash(user_id: int):
     cutoff = datetime.utcnow() - timedelta(days=TRASH_RETENTION_DAYS)
     con = db()
     cur = con.cursor()
+
+    # لو DB قديمة، migration يضمن وجود deleted_at و is_deleted
     cur.execute(
         "DELETE FROM files WHERE user_id=? AND is_deleted=1 AND deleted_at < ?",
         (user_id, cutoff.isoformat(timespec="seconds")),
@@ -536,6 +705,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "👑 أوامر الأدمن:\n"
             "• اكتب اسم المادة ثم ارسل ملفات لإضافتها.\n"
             "• /restore_latest لاسترجاع DB من آخر Backup على السيرفر.\n"
+            "• /restore_seed لاسترجاع DB من ملف Seed داخل /app (GitHub).\n"
             "• /purge_trash تنظيف سلة المحذوفات.\n"
             "• /library عرض LIBRARY_ID الحالي.\n"
             "• /adopt_library تبنّي المكتبة تلقائياً من DB (إذا مختلف).\n"
@@ -733,9 +903,18 @@ async def cb_open_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_id = int(query.data.split(":", 1)[1])
 
     row = get_file_by_id(LIBRARY_ID, file_id)
-    if not row or int(row["is_deleted"]) == 1:
-        await query.message.reply_text("❌ الملف غير موجود أو محذوف.")
+    if not row:
+        await query.message.reply_text("❌ الملف غير موجود.")
         return
+
+    # إذا عندنا is_deleted
+    if _has_is_deleted_column():
+        try:
+            if int(row["is_deleted"]) == 1:
+                await query.message.reply_text("❌ الملف غير موجود أو محذوف.")
+                return
+        except Exception:
+            pass
 
     filename = (row["filename"] or "").strip() or f"file_{file_id}"
     caption = row["caption"] or filename
@@ -787,11 +966,14 @@ async def cb_open_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"❌ تعذر إرسال الملف: {e}")
             return
 
+    # إدارة/عرض
     if is_admin(uid):
+        is_fav_val = int(row["is_fav"]) if "is_fav" in row.keys() else 0
+        is_deleted_val = int(row["is_deleted"]) if ("is_deleted" in row.keys() and row["is_deleted"] is not None) else 0
         await query.message.reply_text(
             f"⚙️ <b>إدارة</b> | #{file_id}",
             parse_mode=ParseMode.HTML,
-            reply_markup=manage_keyboard_admin(file_id, int(row["is_fav"]), int(row["is_deleted"])),
+            reply_markup=manage_keyboard_admin(file_id, is_fav_val, is_deleted_val),
         )
     else:
         await query.message.reply_text("✅", reply_markup=manage_keyboard_viewer())
@@ -885,8 +1067,45 @@ async def restore_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # بعد الاسترجاع، حاول نحدد المكتبة من جديد (إذا LIBRARY_ID مو محدد بالENV)
     global LIBRARY_ID
-    if LIBRARY_ID == 0:
-        LIBRARY_ID = detect_library_id()
+    detected = detect_library_id_legacy() or detect_library_id()
+    if detected:
+        LIBRARY_ID = detected
+
+async def restore_seed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    ✅ يسترجع DB من ملف Seed داخل /app (GitHub repo)
+    لازم تضبط SEED_DB_PATH في Railway Variables
+    """
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ للأدمن فقط.")
+        return
+
+    if not SEED_DB_PATH:
+        await update.message.reply_text("❌ SEED_DB_PATH غير مضبوط داخل Variables في Railway.")
+        return
+
+    seed = Path(SEED_DB_PATH)
+    if not seed.exists():
+        await update.message.reply_text(f"❌ ملف النسخة غير موجود: {SEED_DB_PATH}")
+        return
+
+    try:
+        shutil.copy2(str(seed), DB_PATH)
+        # مهم: بعد النسخ، سوّي init_db حتى يعمل migration لو DB قديمة
+        init_db()
+
+        global LIBRARY_ID
+        detected = detect_library_id_legacy() or detect_library_id()
+        if detected:
+            LIBRARY_ID = detected
+
+        await update.message.reply_text(
+            "✅ تم الاسترجاع من Seed DB بنجاح.\n"
+            f"📚 LIBRARY_ID الآن: {LIBRARY_ID}"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ فشل الاسترجاع: {e}")
 
 async def purge_trash_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -916,6 +1135,7 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Silent backup: {'✅' if SILENT_BACKUP_TO_OWNER else '❌'}\n"
         f"• LIBRARY_ID: {LIBRARY_ID}\n"
         f"• OWNER_ID: {OWNER_ID}\n"
+        f"• SEED_DB_PATH: {SEED_DB_PATH or '(empty)'}\n"
     )
     await update.message.reply_text(msg)
 
@@ -935,7 +1155,7 @@ async def adopt_library(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     global LIBRARY_ID
-    detected = detect_library_id()
+    detected = detect_library_id_legacy() or detect_library_id()
     if detected == 0:
         await update.message.reply_text("❌ DB فارغ أو ماكو ملفات حتى نحدد LIBRARY_ID.")
         return
@@ -960,10 +1180,18 @@ def main():
     # ✅ Auto-detect library id if not provided
     global LIBRARY_ID
     if LIBRARY_ID == 0:
-        LIBRARY_ID = detect_library_id()
+        detected = detect_library_id_legacy() or detect_library_id()
+        if detected:
+            LIBRARY_ID = detected
         # fallback: if still 0, default to OWNER_ID (empty library case)
         if LIBRARY_ID == 0 and OWNER_ID:
             LIBRARY_ID = OWNER_ID
+
+    # ✅ FIX: إذا الـ LIBRARY_ID الحالي ما يملك ملفات لكن DB فيها ملفات لمستخدم آخر
+    if LIBRARY_ID and not library_has_any_files(LIBRARY_ID):
+        detected2 = detect_library_id_legacy() or detect_library_id()
+        if detected2:
+            LIBRARY_ID = detected2
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -980,6 +1208,7 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("restore_latest", restore_latest))
+    app.add_handler(CommandHandler("restore_seed", restore_seed))
     app.add_handler(CommandHandler("purge_trash", purge_trash_cmd))
     app.add_handler(CommandHandler("health", health))
 
