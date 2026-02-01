@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 
 import os
+import re
 import sqlite3
 import shutil
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from telegram import (
     Update,
@@ -24,36 +25,42 @@ from telegram.ext import (
     filters,
 )
 
-# =========================
-# CONFIG
-# =========================
+# ============================================================
+# CONFIG (Railway / Any host via ENV)
+# ============================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
-# ✅ الأفضل على Railway: استخدم Volume ثم خلي DB_PATH داخل /data
-# مثال: DB_PATH=/data/archive.db
-DB_PATH = os.getenv("DB_PATH", "archive.db").strip()
-
-# ✅ ملف "seed" داخل الريبو (النسخة اللي رفعتها على GitHub)
-# إذا archive.db اختفت أو صارت فاضية، راح ينسخ هذا الملف إليها تلقائياً.
-SEED_DB_PATH = os.getenv("SEED_DB_PATH", "archive_backup_20260129_010615.db").strip()
-
-# ✅ حتى يرسل لك النسخ الاحتياطية تلقائياً
-# حط رقم حسابك (Telegram user id) كمتغير بيئة OWNER_ID
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-
-# ✅ كل كم دقيقة يسوي نسخة احتياطية تلقائية (مثلاً 60 = كل ساعة)
-AUTO_BACKUP_MINUTES = int(os.getenv("AUTO_BACKUP_MINUTES", "60"))
-
-# ✅ كم نسخة يحتفظ بها محلياً (إذا عندك /data/backups)
-BACKUP_KEEP = int(os.getenv("BACKUP_KEEP", "20"))
-
-# ✅ مجلد النسخ الاحتياطية (يفضّل داخل /data إذا عندك Volume)
-BACKUP_DIR = os.getenv("BACKUP_DIR", "backups").strip()
-
 if not BOT_TOKEN:
-    raise SystemExit("❌ BOT_TOKEN غير مضبوط. استخدم: export BOT_TOKEN='xxxxx'")
+    raise SystemExit("❌ BOT_TOKEN غير مضبوط")
 
-# موادك الرسمية
+# ⚠️ أهم شيء للاحتراف: خزن داخل Volume (Railway volume)
+DB_PATH = os.getenv("DB_PATH", "/data/archive.db").strip()
+
+FILES_DIR = os.getenv("FILES_DIR", "/data/files").strip()
+BACKUP_DIR = os.getenv("BACKUP_DIR", "/data/backups").strip()
+
+# نسخة Seed (اختياري) إذا تريد ترجع بيانات أول مرة
+SEED_DB_PATH = os.getenv("SEED_DB_PATH", "").strip()  # مثال: "archive_backup_20260129_010615.db"
+
+# Admins / Owner
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()  # "123,456"
+ADMIN_IDS = set()
+if ADMIN_IDS_RAW:
+    for x in ADMIN_IDS_RAW.split(","):
+        x = x.strip()
+        if x.isdigit():
+            ADMIN_IDS.add(int(x))
+if OWNER_ID:
+    ADMIN_IDS.add(OWNER_ID)
+
+# Backup scheduler
+AUTO_BACKUP_MINUTES = int(os.getenv("AUTO_BACKUP_MINUTES", "60"))
+BACKUP_KEEP = int(os.getenv("BACKUP_KEEP", "30"))
+
+# Delete / Trash
+TRASH_RETENTION_DAYS = int(os.getenv("TRASH_RETENTION_DAYS", "30"))
+
+# Subjects
 SUBJECTS = [
     "Poetry",
     "Writing",
@@ -66,7 +73,6 @@ SUBJECTS = [
     "Listening and speaking",
 ]
 
-# رموز أنيقة لكل مادة
 SUBJECT_EMOJI = {
     "Poetry": "🪶",
     "Writing": "✍️",
@@ -79,7 +85,7 @@ SUBJECT_EMOJI = {
     "Listening and speaking": "🎧",
 }
 
-# لوحة رئيسية (Reply keyboard)
+# Main keyboard (Reply)
 MAIN_KB = ReplyKeyboardMarkup(
     [
         [KeyboardButton("📚 المواد"), KeyboardButton("🧾 آخر الملفات")],
@@ -89,98 +95,121 @@ MAIN_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-# =========================
-# PATH HELPERS
-# =========================
-def ensure_dirs():
-    # أنشئ مجلد قاعدة البيانات إن كان DB_PATH داخل مجلد (مثل /data/archive.db)
-    db_file = Path(DB_PATH)
-    if db_file.parent and str(db_file.parent) not in (".", ""):
-        db_file.parent.mkdir(parents=True, exist_ok=True)
+# ============================================================
+# PATH / UTIL
+# ============================================================
+def utcnow_str():
+    return datetime.utcnow().isoformat(timespec="seconds")
 
-    # مجلد النسخ الاحتياطية
+def ensure_dirs():
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    Path(FILES_DIR).mkdir(parents=True, exist_ok=True)
     Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
 
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
-def db_exists_and_not_empty(path: str) -> bool:
-    p = Path(path)
-    return p.exists() and p.is_file() and p.stat().st_size > 10_000  # حجم تقريبي يدل أنه مو فاضي
+def safe_filename(name: str, fallback: str) -> str:
+    name = (name or "").strip()
+    if not name:
+        return fallback
+    # remove weird chars
+    name = re.sub(r"[^\w\-. ()\[\]{}]+", "_", name, flags=re.UNICODE)
+    name = name.strip(" ._")
+    return name or fallback
 
+def normalize_subject(text: str):
+    t = (text or "").strip()
+    for s in SUBJECTS:
+        if t.lower() == s.lower():
+            return s
+    return None
 
-def seed_db_if_needed():
-    """
-    إذا قاعدة البيانات الأساسية غير موجودة أو فاضية،
-    انسخ إليها ملف SEED_DB_PATH الموجود في الريبو.
-    """
-    # إذا DB موجودة وبيها بيانات، لا تسوي شيء
-    if db_exists_and_not_empty(DB_PATH):
-        return
-
-    # إذا seed موجود وبي بيانات، انسخه إلى DB_PATH
-    if db_exists_and_not_empty(SEED_DB_PATH):
-        shutil.copy2(SEED_DB_PATH, DB_PATH)
-
-
-# =========================
+# ============================================================
 # DB
-# =========================
+# ============================================================
 def db():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     return con
 
-
 def init_db():
     con = db()
     cur = con.cursor()
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             subject TEXT NOT NULL,
-            file_type TEXT NOT NULL,     -- document/photo/video/audio/voice
-            tg_file_id TEXT NOT NULL,    -- Telegram file_id (أفضل للفتح السريع)
+            file_type TEXT NOT NULL,
+            tg_file_id TEXT NOT NULL,
             filename TEXT,
             caption TEXT,
+            local_path TEXT,              -- ✅ الملف محفوظ فعليًا هنا
             added_at TEXT NOT NULL,
-            is_fav INTEGER NOT NULL DEFAULT 0
+            is_fav INTEGER NOT NULL DEFAULT 0,
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            deleted_at TEXT
         );
         """
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_files_user_subject ON files(user_id, subject);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_files_user_added ON files(user_id, added_at);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_files_deleted ON files(user_id, is_deleted);")
+
     con.commit()
     con.close()
 
+def db_has_data() -> bool:
+    try:
+        con = db()
+        cur = con.cursor()
+        cur.execute("SELECT COUNT(*) FROM files")
+        n = cur.fetchone()[0]
+        con.close()
+        return n > 0
+    except Exception:
+        return False
 
-def add_file(user_id: int, subject: str, file_type: str, tg_file_id: str, filename: str | None, caption: str | None):
+def seed_db_if_needed():
+    # إذا ما عندك Seed أو DB عندك فيها بيانات، تجاهل
+    if not SEED_DB_PATH:
+        return
+    if db_has_data():
+        return
+    seed = Path(SEED_DB_PATH)
+    if seed.exists() and seed.is_file() and seed.stat().st_size > 10_000:
+        # فقط إذا DB غير موجودة أو فاضية فعلاً
+        shutil.copy2(str(seed), DB_PATH)
+
+def add_file_row(user_id: int, subject: str, file_type: str, tg_file_id: str,
+                 filename: str | None, caption: str | None, local_path: str | None):
     con = db()
     cur = con.cursor()
     cur.execute(
         """
-        INSERT INTO files (user_id, subject, file_type, tg_file_id, filename, caption, added_at, is_fav)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+        INSERT INTO files (user_id, subject, file_type, tg_file_id, filename, caption, local_path, added_at, is_fav, is_deleted)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
         """,
-        (user_id, subject, file_type, tg_file_id, filename, caption, datetime.utcnow().isoformat(timespec="seconds")),
+        (user_id, subject, file_type, tg_file_id, filename, caption, local_path, utcnow_str()),
     )
     con.commit()
     new_id = cur.lastrowid
     con.close()
     return new_id
 
-
 def count_by_subject(user_id: int):
     con = db()
     cur = con.cursor()
     cur.execute(
-        "SELECT subject, COUNT(*) cnt FROM files WHERE user_id=? GROUP BY subject",
+        "SELECT subject, COUNT(*) cnt FROM files WHERE user_id=? AND is_deleted=0 GROUP BY subject",
         (user_id,),
     )
     rows = cur.fetchall()
     con.close()
     return [(r[0], r[1]) for r in rows]
-
 
 def list_files_by_subject(user_id: int, subject: str, limit: int = 50):
     con = db()
@@ -189,7 +218,7 @@ def list_files_by_subject(user_id: int, subject: str, limit: int = 50):
         """
         SELECT id, file_type, filename, caption, added_at, is_fav
         FROM files
-        WHERE user_id=? AND subject=?
+        WHERE user_id=? AND subject=? AND is_deleted=0
         ORDER BY id DESC
         LIMIT ?
         """,
@@ -199,13 +228,12 @@ def list_files_by_subject(user_id: int, subject: str, limit: int = 50):
     con.close()
     return rows
 
-
 def get_file_by_id(user_id: int, file_id: int):
     con = db()
     cur = con.cursor()
     cur.execute(
         """
-        SELECT id, subject, file_type, tg_file_id, filename, caption, added_at, is_fav
+        SELECT *
         FROM files
         WHERE user_id=? AND id=?
         """,
@@ -215,7 +243,6 @@ def get_file_by_id(user_id: int, file_id: int):
     con.close()
     return row
 
-
 def set_fav(user_id: int, file_id: int, fav: int):
     con = db()
     cur = con.cursor()
@@ -223,14 +250,25 @@ def set_fav(user_id: int, file_id: int, fav: int):
     con.commit()
     con.close()
 
-
-def delete_file(user_id: int, file_id: int):
+def soft_delete_file(user_id: int, file_id: int):
     con = db()
     cur = con.cursor()
-    cur.execute("DELETE FROM files WHERE user_id=? AND id=?", (user_id, file_id))
+    cur.execute(
+        "UPDATE files SET is_deleted=1, deleted_at=? WHERE user_id=? AND id=?",
+        (utcnow_str(), user_id, file_id),
+    )
     con.commit()
     con.close()
 
+def restore_file(user_id: int, file_id: int):
+    con = db()
+    cur = con.cursor()
+    cur.execute(
+        "UPDATE files SET is_deleted=0, deleted_at=NULL WHERE user_id=? AND id=?",
+        (user_id, file_id),
+    )
+    con.commit()
+    con.close()
 
 def list_recent(user_id: int, limit: int = 10):
     con = db()
@@ -239,7 +277,7 @@ def list_recent(user_id: int, limit: int = 10):
         """
         SELECT id, subject, file_type, filename, caption, added_at, is_fav
         FROM files
-        WHERE user_id=?
+        WHERE user_id=? AND is_deleted=0
         ORDER BY id DESC
         LIMIT ?
         """,
@@ -248,7 +286,6 @@ def list_recent(user_id: int, limit: int = 10):
     rows = cur.fetchall()
     con.close()
     return rows
-
 
 def list_favorites(user_id: int, limit: int = 50):
     con = db()
@@ -257,7 +294,7 @@ def list_favorites(user_id: int, limit: int = 50):
         """
         SELECT id, subject, file_type, filename, caption, added_at, is_fav
         FROM files
-        WHERE user_id=? AND is_fav=1
+        WHERE user_id=? AND is_deleted=0 AND is_fav=1
         ORDER BY id DESC
         LIMIT ?
         """,
@@ -266,7 +303,6 @@ def list_favorites(user_id: int, limit: int = 50):
     rows = cur.fetchall()
     con.close()
     return rows
-
 
 def search_files(user_id: int, q: str, limit: int = 30):
     like = f"%{q}%"
@@ -276,7 +312,7 @@ def search_files(user_id: int, q: str, limit: int = 30):
         """
         SELECT id, subject, file_type, filename, caption, added_at, is_fav
         FROM files
-        WHERE user_id=?
+        WHERE user_id=? AND is_deleted=0
           AND (filename LIKE ? OR caption LIKE ?)
         ORDER BY id DESC
         LIMIT ?
@@ -287,20 +323,28 @@ def search_files(user_id: int, q: str, limit: int = 30):
     con.close()
     return rows
 
+def purge_trash(user_id: int):
+    """
+    يحذف نهائيًا الملفات المحذوفة من فترة طويلة
+    (لا يحذف الـ local file هنا، فقط سجل DB لتجنب كوارث)
+    """
+    cutoff = datetime.utcnow() - timedelta(days=TRASH_RETENTION_DAYS)
+    con = db()
+    cur = con.cursor()
+    cur.execute(
+        "DELETE FROM files WHERE user_id=? AND is_deleted=1 AND deleted_at < ?",
+        (user_id, cutoff.isoformat(timespec="seconds")),
+    )
+    con.commit()
+    con.close()
 
-# =========================
-# BACKUP (SAFE)
-# =========================
+# ============================================================
+# BACKUP (SQLite safe)
+# ============================================================
 def make_backup_name() -> str:
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    return f"archive_backup_{ts}.db"
-
+    return f"archive_backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.db"
 
 def make_sqlite_backup(dest_path: str):
-    """
-    نسخة احتياطية آمنة باستخدام sqlite backup API
-    أفضل من copy المباشر أثناء الكتابة.
-    """
     src = sqlite3.connect(DB_PATH)
     dst = sqlite3.connect(dest_path)
     try:
@@ -309,14 +353,9 @@ def make_sqlite_backup(dest_path: str):
         dst.close()
         src.close()
 
-
 def cleanup_old_backups():
-    """
-    يحذف أقدم النسخ إذا تجاوزت BACKUP_KEEP
-    """
     if BACKUP_KEEP <= 0:
         return
-
     bdir = Path(BACKUP_DIR)
     files = sorted(bdir.glob("archive_backup_*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
     for p in files[BACKUP_KEEP:]:
@@ -324,7 +363,6 @@ def cleanup_old_backups():
             p.unlink()
         except Exception:
             pass
-
 
 async def send_backup_to_owner(context: ContextTypes.DEFAULT_TYPE, backup_path: Path, caption: str):
     if OWNER_ID == 0:
@@ -337,80 +375,75 @@ async def send_backup_to_owner(context: ContextTypes.DEFAULT_TYPE, backup_path: 
                 filename=backup_path.name,
                 caption=caption,
             )
-    except Exception as e:
-        try:
-            await context.bot.send_message(chat_id=OWNER_ID, text=f"❌ فشل إرسال النسخة الاحتياطية: {e}")
-        except Exception:
-            pass
-
+    except Exception:
+        # لا نكسر البوت إذا فشل الإرسال
+        pass
 
 async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
-    if OWNER_ID == 0:
-        return
-
     try:
         backup_name = make_backup_name()
         backup_path = Path(BACKUP_DIR) / backup_name
-
         make_sqlite_backup(str(backup_path))
         cleanup_old_backups()
+        await send_backup_to_owner(context, backup_path, "✅ Auto-backup (DB)")
+    except Exception:
+        pass
 
-        await send_backup_to_owner(context, backup_path, "✅ نسخة احتياطية تلقائية من قاعدة البيانات")
-    except Exception as e:
-        try:
-            await context.bot.send_message(chat_id=OWNER_ID, text=f"❌ فشل النسخ الاحتياطي التلقائي: {e}")
-        except Exception:
-            pass
+def restore_from_latest_backup() -> str:
+    """
+    يسترجع قاعدة البيانات من آخر Backup داخل BACKUP_DIR
+    """
+    bdir = Path(BACKUP_DIR)
+    files = sorted(bdir.glob("archive_backup_*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        return "❌ ماكو أي Backup داخل السيرفر."
+    latest = files[0]
+    shutil.copy2(str(latest), DB_PATH)
+    return f"✅ تم الاسترجاع من: {latest.name}"
 
-
-# =========================
+# ============================================================
 # UI Helpers
-# =========================
+# ============================================================
 def subjects_keyboard(user_id: int):
     counts = dict(count_by_subject(user_id))
-
     items = []
     for s in SUBJECTS:
         emoji = SUBJECT_EMOJI.get(s, "📘")
         cnt = counts.get(s, 0)
         items.append(InlineKeyboardButton(f"{emoji} {s} ({cnt})", callback_data=f"subj:{s}"))
-
     buttons = []
     for i in range(0, len(items), 2):
-        buttons.append(items[i:i + 2])
-
+        buttons.append(items[i:i+2])
     buttons.append([InlineKeyboardButton("↩️ رجوع", callback_data="back:home")])
     return InlineKeyboardMarkup(buttons)
-
 
 def files_keyboard(subject: str, rows):
     items = []
     for r in rows:
         fid = int(r["id"])
-        name = (r["filename"] or "").strip()
-        if not name:
-            name = r["caption"] or f"file_{fid}"
-
+        name = (r["filename"] or "").strip() or (r["caption"] or f"file_{fid}")
         clean = name.replace("\n", " ").strip()
         if len(clean) > 26:
             clean = clean[:23] + "…"
-
         items.append(InlineKeyboardButton(f"📄 {clean}", callback_data=f"open:{fid}"))
-
     buttons = []
     for i in range(0, len(items), 2):
-        buttons.append(items[i:i + 2])
-
+        buttons.append(items[i:i+2])
     buttons.append([InlineKeyboardButton("↩️ رجوع للمواد", callback_data="back:subjects")])
     return InlineKeyboardMarkup(buttons)
 
-
-def manage_keyboard(file_id: int, is_fav: int):
+def manage_keyboard_admin(file_id: int, is_fav: int, is_deleted: int):
+    # Admin only
     fav_btn = InlineKeyboardButton("⭐ إزالة من المفضلة" if is_fav else "⭐ إضافة للمفضلة", callback_data=f"fav:{file_id}")
-    del_btn = InlineKeyboardButton("🗑️ حذف", callback_data=f"del:{file_id}")
-    back_btn = InlineKeyboardButton("↩️ رجوع للمواد", callback_data="back:subjects")
-    return InlineKeyboardMarkup([[fav_btn, del_btn], [back_btn]])
+    if is_deleted:
+        restore_btn = InlineKeyboardButton("♻️ استرجاع", callback_data=f"restore:{file_id}")
+        return InlineKeyboardMarkup([[restore_btn], [InlineKeyboardButton("↩️ رجوع", callback_data="back:subjects")]])
+    del_confirm = InlineKeyboardButton("🗑️ حذف (تأكيد)", callback_data=f"del2:{file_id}")
+    back_btn = InlineKeyboardButton("↩️ رجوع", callback_data="back:subjects")
+    return InlineKeyboardMarkup([[fav_btn, del_confirm], [back_btn]])
 
+def manage_keyboard_viewer():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("↩️ رجوع", callback_data="back:subjects")]])
 
 def pretty_file_line(r):
     subj = r["subject"]
@@ -419,137 +452,49 @@ def pretty_file_line(r):
     fav = "⭐" if r["is_fav"] else ""
     return f"{fav}{emoji} <b>{subj}</b> | #{r['id']} | {name} | {r['added_at']}"
 
-
-# =========================
-# Bot Handlers
-# =========================
+# ============================================================
+# HANDLERS
+# ============================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("fixed_subject", None)
-    context.user_data.pop("search_mode", None)
+    context.user_data.clear()
+    uid = update.effective_user.id
 
+    role = "👑 Admin" if is_admin(uid) else "👀 Viewer"
     text = (
-        "يا هلا رأفت 👋\n"
-        "أنا بوت الأرشفة الذكي 📚\n\n"
-        "✅ تقدر تأرشف بطريقتين:\n"
-        "1) من الأزرار: 📚 المواد → اختر مادة → ارسل الملف.\n"
-        "2) الأسرع: اكتب اسم المادة لوحده (مثلاً: Linguistics) ثم ارسل/حوّل ملفات بعدها.\n"
-        "   (يبقى ثابت 10 دقائق)\n\n"
+        f"يا هلا 👋\n"
+        f"وضعك الحالي: <b>{role}</b>\n\n"
+        "📚 هذا بوت أرشفة للجامعة.\n"
+        "• الطلاب: تصفّح فقط.\n"
+        "• الأدمن: يضيف/يحذف/يسوي Backup.\n\n"
         "اضغط من القائمة 👇"
     )
-    await update.message.reply_text(text, reply_markup=MAIN_KB)
-
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=MAIN_KB)
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    await update.message.reply_text(f"🆔 Your Telegram ID:\n<code>{uid}</code>", parse_mode=ParseMode.HTML)
-
+    await update.message.reply_text(f"🆔 Telegram ID:\n<code>{uid}</code>", parse_mode=ParseMode.HTML)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    uid = update.effective_user.id
+    admin = is_admin(uid)
+    msg = (
         "ℹ️ مساعدة:\n"
-        "• 📚 المواد: عرض موادك وعدد الملفات داخل كل مادة.\n"
-        "• لتحفظ بسرعة: اكتب اسم المادة فقط ثم ابعث ملفات.\n"
-        "• لفتح ملف: ادخل المادة واضغط اسم الملف من القائمة.\n"
-        "• ⭐ المفضلة: ملفاتك المميزة.\n"
-        "• 🧾 آخر الملفات: آخر ما حفظته.\n"
-        "• 📦 نسخة احتياطية: Backup يدوي.\n"
-        "• النسخ التلقائي: يعتمد على AUTO_BACKUP_MINUTES.\n",
-        reply_markup=MAIN_KB,
+        "• 📚 المواد: عرض المواد.\n"
+        "• 🧾 آخر الملفات: آخر الأرشيف.\n"
+        "• ⭐ المفضلة.\n"
+        "• 🔎 بحث.\n"
+        "• 📦 نسخة احتياطية: يدوي.\n\n"
     )
-
-
-def normalize_subject(text: str):
-    t = text.strip()
-    for s in SUBJECTS:
-        if t.lower() == s.lower():
-            return s
-    return None
-
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-
-    # بحث
-    if context.user_data.get("search_mode"):
-        q = text
-        context.user_data["search_mode"] = False
-        rows = search_files(update.effective_user.id, q)
-        if not rows:
-            await update.message.reply_text("🔎 ما لقيت نتائج.", reply_markup=MAIN_KB)
-            return
-        msg = "🔎 نتائج البحث:\n\n" + "\n".join(pretty_file_line(r) for r in rows)
-        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=MAIN_KB)
-        return
-
-    # أوامر من الأزرار
-    if text == "📚 المواد":
-        kb = subjects_keyboard(update.effective_user.id)
-        await update.message.reply_text("📚 موادك (مع عدد الملفات):\n👇 اضغط مادة", reply_markup=kb)
-        return
-
-    if text == "🧾 آخر الملفات":
-        rows = list_recent(update.effective_user.id, 12)
-        if not rows:
-            await update.message.reply_text("✅ ما عندك أرشيف بعد. أرشف أول ملف.", reply_markup=MAIN_KB)
-            return
-        msg = "🧾 آخر الملفات:\n\n" + "\n".join(pretty_file_line(r) for r in rows)
-        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=MAIN_KB)
-        return
-
-    if text == "⭐ المفضلة":
-        rows = list_favorites(update.effective_user.id, 50)
-        if not rows:
-            await update.message.reply_text("⭐ ما عندك ملفات مفضلة بعد.", reply_markup=MAIN_KB)
-            return
-        msg = "⭐ المفضلة:\n\n" + "\n".join(pretty_file_line(r) for r in rows)
-        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=MAIN_KB)
-        return
-
-    if text == "🔎 بحث":
-        context.user_data["search_mode"] = True
-        await update.message.reply_text("🔎 اكتب كلمة من اسم الملف أو الوصف:", reply_markup=MAIN_KB)
-        return
-
-    # نسخة احتياطية يدوية
-    if text == "📦 نسخة احتياطية":
-        try:
-            backup_name = make_backup_name()
-            backup_path = Path(BACKUP_DIR) / backup_name
-
-            make_sqlite_backup(str(backup_path))
-            cleanup_old_backups()
-
-            with open(backup_path, "rb") as f:
-                await update.message.reply_document(
-                    document=f,
-                    filename=backup_name,
-                    caption="📦 نسخة احتياطية من قاعدة البيانات"
-                )
-        except Exception as e:
-            await update.message.reply_text(f"❌ فشل النسخ الاحتياطي: {e}")
-        return
-
-    if text == "ℹ️ مساعدة":
-        await help_cmd(update, context)
-        return
-
-    # تثبيت مادة سريع بالكتابة
-    subj = normalize_subject(text)
-    if subj:
-        context.user_data["fixed_subject"] = subj
-        context.user_data["fixed_until"] = datetime.utcnow().timestamp() + (10 * 60)
-        emoji = SUBJECT_EMOJI.get(subj, "📘")
-        await update.message.reply_text(
-            f"✅ ثبتت المادة مؤقتاً: {emoji} <b>{subj}</b>\n"
-            "الآن ارسل/حوّل ملفات... (صالح 10 دقائق)\n"
-            "إذا تريد وصف: اكتب Caption مع الملف.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=MAIN_KB,
+    if admin:
+        msg += (
+            "👑 أوامر الأدمن:\n"
+            "• اكتب اسم المادة ثم ارسل ملفات لإضافتها.\n"
+            "• /restore_latest لاسترجاع DB من آخر Backup على السيرفر.\n"
+            "• /purge_trash تنظيف سلة المحذوفات.\n"
         )
-        return
-
-    await update.message.reply_text("ما فهمت 😅\nاضغط من القائمة: 📚 المواد أو اكتب اسم المادة لتثبيتها.", reply_markup=MAIN_KB)
-
+    else:
+        msg += "👀 أنت Viewer: تقدر تشوف وتفتح الملفات فقط."
+    await update.message.reply_text(msg, reply_markup=MAIN_KB)
 
 def get_fixed_subject(context: ContextTypes.DEFAULT_TYPE):
     subj = context.user_data.get("fixed_subject")
@@ -560,13 +505,98 @@ def get_fixed_subject(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("fixed_until", None)
     return None
 
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    text = (update.message.text or "").strip()
+
+    # Search mode
+    if context.user_data.get("search_mode"):
+        context.user_data["search_mode"] = False
+        rows = search_files(OWNER_ID, text)  # ✅ كل الناس تشوف أرشيف OWNER فقط
+        if not rows:
+            await update.message.reply_text("🔎 ماكو نتائج.", reply_markup=MAIN_KB)
+            return
+        msg = "🔎 نتائج البحث:\n\n" + "\n".join(pretty_file_line(r) for r in rows)
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=MAIN_KB)
+        return
+
+    # Buttons
+    if text == "📚 المواد":
+        kb = subjects_keyboard(OWNER_ID)  # ✅ الكل يشوف أرشيف OWNER
+        await update.message.reply_text("📚 المواد:\n👇 اضغط مادة", reply_markup=kb)
+        return
+
+    if text == "🧾 آخر الملفات":
+        rows = list_recent(OWNER_ID, 12)
+        if not rows:
+            await update.message.reply_text("ماكو أرشيف بعد.", reply_markup=MAIN_KB)
+            return
+        msg = "🧾 آخر الملفات:\n\n" + "\n".join(pretty_file_line(r) for r in rows)
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=MAIN_KB)
+        return
+
+    if text == "⭐ المفضلة":
+        rows = list_favorites(OWNER_ID, 50)
+        if not rows:
+            await update.message.reply_text("⭐ ماكو مفضلة بعد.", reply_markup=MAIN_KB)
+            return
+        msg = "⭐ المفضلة:\n\n" + "\n".join(pretty_file_line(r) for r in rows)
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=MAIN_KB)
+        return
+
+    if text == "🔎 بحث":
+        context.user_data["search_mode"] = True
+        await update.message.reply_text("🔎 اكتب كلمة من اسم الملف/الوصف:", reply_markup=MAIN_KB)
+        return
+
+    if text == "📦 نسخة احتياطية":
+        # Viewer يقدر يطلب؟ الأفضل لا — نخليها للأدمن فقط
+        if not is_admin(uid):
+            await update.message.reply_text("⛔ النسخ الاحتياطي للأدمن فقط.", reply_markup=MAIN_KB)
+            return
+        try:
+            backup_name = make_backup_name()
+            backup_path = Path(BACKUP_DIR) / backup_name
+            make_sqlite_backup(str(backup_path))
+            cleanup_old_backups()
+            with open(backup_path, "rb") as f:
+                await update.message.reply_document(document=f, filename=backup_name, caption="📦 Backup (DB)")
+        except Exception as e:
+            await update.message.reply_text(f"❌ فشل النسخ: {e}")
+        return
+
+    if text == "ℹ️ مساعدة":
+        await help_cmd(update, context)
+        return
+
+    # Fix subject (Admin only)
+    subj = normalize_subject(text)
+    if subj:
+        if not is_admin(uid):
+            await update.message.reply_text("👀 تقدر تتصفح فقط. إضافة ملفات للأدمن فقط.", reply_markup=MAIN_KB)
+            return
+        context.user_data["fixed_subject"] = subj
+        context.user_data["fixed_until"] = datetime.utcnow().timestamp() + (10 * 60)
+        emoji = SUBJECT_EMOJI.get(subj, "📘")
+        await update.message.reply_text(
+            f"✅ ثبتت المادة مؤقتاً: {emoji} <b>{subj}</b>\n"
+            "الآن ارسل/حوّل ملفات… (10 دقائق)",
+            parse_mode=ParseMode.HTML,
+            reply_markup=MAIN_KB,
+        )
+        return
+
+    await update.message.reply_text("ما فهمت 😅\nاضغط 📚 المواد أو 🔎 بحث.", reply_markup=MAIN_KB)
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ الإضافة للأدمن فقط. أنت تقدر تتصفح الملفات.", reply_markup=MAIN_KB)
+        return
+
     subj = get_fixed_subject(context)
     if not subj:
-        kb = subjects_keyboard(user_id)
-        await update.message.reply_text("👇 اختر مادة أولاً لحفظ الملف:", reply_markup=kb)
+        await update.message.reply_text("👇 اكتب اسم المادة أولاً (مثل Linguistics) ثم ارسل الملف.", reply_markup=MAIN_KB)
         return
 
     msg = update.message
@@ -574,162 +604,289 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     file_type = None
     tg_file_id = None
-    filename = None
+    orig_name = None
 
     if msg.document:
         file_type = "document"
         tg_file_id = msg.document.file_id
-        filename = msg.document.file_name
+        orig_name = msg.document.file_name
     elif msg.photo:
         file_type = "photo"
         tg_file_id = msg.photo[-1].file_id
-        filename = "photo.jpg"
+        orig_name = "photo.jpg"
     elif msg.video:
         file_type = "video"
         tg_file_id = msg.video.file_id
-        filename = "video.mp4"
+        orig_name = "video.mp4"
     elif msg.audio:
         file_type = "audio"
         tg_file_id = msg.audio.file_id
-        filename = msg.audio.file_name or "audio.mp3"
+        orig_name = msg.audio.file_name or "audio.mp3"
     elif msg.voice:
         file_type = "voice"
         tg_file_id = msg.voice.file_id
-        filename = "voice.ogg"
+        orig_name = "voice.ogg"
     else:
-        await update.message.reply_text("⚠️ هذا النوع غير مدعوم حالياً.", reply_markup=MAIN_KB)
+        await update.message.reply_text("⚠️ نوع غير مدعوم.", reply_markup=MAIN_KB)
         return
 
-    new_id = add_file(user_id, subj, file_type, tg_file_id, filename, caption)
-
+    # ✅ حفظ الملف فعليًا على السيرفر
+    # مسار: /data/files/<subject>/<timestamp>_<filename>
     emoji = SUBJECT_EMOJI.get(subj, "📘")
+    subject_dir = Path(FILES_DIR) / subj
+    subject_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    safe_name = safe_filename(orig_name, f"{file_type}_{ts}")
+    local_path = subject_dir / f"{ts}_{safe_name}"
+
+    try:
+        tg_file = await context.bot.get_file(tg_file_id)
+        await tg_file.download_to_drive(custom_path=str(local_path))
+    except Exception:
+        # إذا فشل التحميل، نخزن سجل بدون local_path ونستخدم tg_file_id فقط
+        local_path = None
+
+    new_id = add_file_row(
+        user_id=OWNER_ID,               # ✅ نخزن كل الملفات تحت مالك البوت (مكتبة عامة)
+        subject=subj,
+        file_type=file_type,
+        tg_file_id=tg_file_id,
+        filename=safe_name,
+        caption=caption,
+        local_path=str(local_path) if local_path else None
+    )
+
     await update.message.reply_text(
-        f"✅ تمت الأرشفة بنجاح!\n"
-        f"المادة: {emoji} {subj}\n"
+        f"✅ تمت الإضافة للمكتبة العامة!\n"
+        f"{emoji} {subj}\n"
         f"رقم: #{new_id}\n"
-        f"الوصف: {caption or '—'}\n"
-        f"⏳ تثبيت المادة ما زال فعالاً.",
+        f"تم الحفظ المحلي: {'✅' if local_path else '⚠️ لا (اعتماد على تيليجرام)'}",
         reply_markup=MAIN_KB,
     )
 
-
-# =========================
-# Callbacks
-# =========================
+# ============================================================
+# CALLBACKS
+# ============================================================
 async def cb_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     subject = query.data.split(":", 1)[1]
-    user_id = query.from_user.id
-
-    rows = list_files_by_subject(user_id, subject, 50)
+    rows = list_files_by_subject(OWNER_ID, subject, 50)
     emoji = SUBJECT_EMOJI.get(subject, "📘")
 
     if not rows:
-        await query.message.reply_text(f"✅ {emoji} {subject}\nماكو ملفات بعد. أرشف أول ملف.", reply_markup=MAIN_KB)
+        await query.message.reply_text(f"{emoji} {subject}\nماكو ملفات بعد.", reply_markup=MAIN_KB)
         return
 
     kb = files_keyboard(subject, rows)
-    await query.message.reply_text(f"{emoji} <b>{subject}</b> — اختر ملف لفتحه:", parse_mode=ParseMode.HTML, reply_markup=kb)
-
+    await query.message.reply_text(f"{emoji} <b>{subject}</b> — اختر ملف:", parse_mode=ParseMode.HTML, reply_markup=kb)
 
 async def cb_open_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    user_id = query.from_user.id
+    uid = query.from_user.id
     file_id = int(query.data.split(":", 1)[1])
 
-    row = get_file_by_id(user_id, file_id)
-    if not row:
-        await query.message.reply_text("❌ الملف غير موجود أو تم حذفه.")
+    row = get_file_by_id(OWNER_ID, file_id)
+    if not row or int(row["is_deleted"]) == 1:
+        await query.message.reply_text("❌ الملف غير موجود أو محذوف.")
         return
 
-    subj = row["subject"]
-    emoji = SUBJECT_EMOJI.get(subj, "📘")
     filename = (row["filename"] or "").strip() or f"file_{file_id}"
-    caption = row["caption"] or None
-    is_fav = int(row["is_fav"])
+    caption = row["caption"] or filename
 
-    if row["file_type"] == "document":
-        await query.message.reply_document(document=row["tg_file_id"], caption=caption or filename)
-    elif row["file_type"] == "photo":
-        await query.message.reply_photo(photo=row["tg_file_id"], caption=caption or filename)
-    elif row["file_type"] == "video":
-        await query.message.reply_video(video=row["tg_file_id"], caption=caption or filename)
-    elif row["file_type"] == "audio":
-        await query.message.reply_audio(audio=row["tg_file_id"], caption=caption or filename)
-    elif row["file_type"] == "voice":
-        await query.message.reply_voice(voice=row["tg_file_id"], caption=caption or filename)
+    local_path = row["local_path"]
+    sent = False
+
+    # ✅ الأفضل: من التخزين المحلي
+    if local_path:
+        p = Path(local_path)
+        if p.exists() and p.is_file():
+            try:
+                if row["file_type"] == "photo":
+                    with open(p, "rb") as f:
+                        await query.message.reply_photo(photo=f, caption=caption)
+                elif row["file_type"] == "video":
+                    with open(p, "rb") as f:
+                        await query.message.reply_video(video=f, caption=caption)
+                elif row["file_type"] == "audio":
+                    with open(p, "rb") as f:
+                        await query.message.reply_audio(audio=f, caption=caption)
+                elif row["file_type"] == "voice":
+                    with open(p, "rb") as f:
+                        await query.message.reply_voice(voice=f, caption=caption)
+                else:
+                    with open(p, "rb") as f:
+                        await query.message.reply_document(document=f, caption=caption, filename=filename)
+                sent = True
+            except Exception:
+                sent = False
+
+    # خطة B: من تيليجرام
+    if not sent:
+        try:
+            ft = row["file_type"]
+            fid = row["tg_file_id"]
+            if ft == "document":
+                await query.message.reply_document(document=fid, caption=caption)
+            elif ft == "photo":
+                await query.message.reply_photo(photo=fid, caption=caption)
+            elif ft == "video":
+                await query.message.reply_video(video=fid, caption=caption)
+            elif ft == "audio":
+                await query.message.reply_audio(audio=fid, caption=caption)
+            elif ft == "voice":
+                await query.message.reply_voice(voice=fid, caption=caption)
+            else:
+                await query.message.reply_text("⚠️ نوع غير مدعوم.")
+                return
+        except Exception as e:
+            await query.message.reply_text(f"❌ تعذر إرسال الملف: {e}")
+            return
+
+    # إدارة: أدمن فقط
+    if is_admin(uid):
+        await query.message.reply_text(
+            f"⚙️ <b>إدارة</b> | #{file_id}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=manage_keyboard_admin(file_id, int(row["is_fav"]), int(row["is_deleted"])),
+        )
     else:
-        await query.message.reply_text("⚠️ نوع الملف غير مدعوم.")
-        return
-
-    await query.message.reply_text(
-        f"⚙️ <b>إدارة الملف</b>:\n{emoji} {subj} | #{file_id}\n📄 {filename}",
-        parse_mode=ParseMode.HTML,
-        reply_markup=manage_keyboard(file_id, is_fav),
-    )
-
+        await query.message.reply_text("✅", reply_markup=manage_keyboard_viewer())
 
 async def cb_fav(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    user_id = query.from_user.id
+    uid = query.from_user.id
+    if not is_admin(uid):
+        await query.message.reply_text("⛔ هذا الخيار للأدمن فقط.")
+        return
+
     file_id = int(query.data.split(":", 1)[1])
-    row = get_file_by_id(user_id, file_id)
+    row = get_file_by_id(OWNER_ID, file_id)
     if not row:
         await query.message.reply_text("❌ الملف غير موجود.")
         return
 
     new_fav = 0 if int(row["is_fav"]) else 1
-    set_fav(user_id, file_id, new_fav)
-
+    set_fav(OWNER_ID, file_id, new_fav)
     await query.message.reply_text("⭐ تم تحديث المفضلة.")
-    await query.message.reply_text("⚙️ إدارة الملف:", reply_markup=manage_keyboard(file_id, new_fav))
 
+async def cb_del_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    uid = query.from_user.id
+    if not is_admin(uid):
+        await query.message.reply_text("⛔ هذا الخيار للأدمن فقط.")
+        return
+
+    file_id = int(query.data.split(":", 1)[1])
+    row = get_file_by_id(OWNER_ID, file_id)
+    if not row:
+        await query.message.reply_text("❌ الملف غير موجود.")
+        return
+
+    # تأكيد أول
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ نعم احذف", callback_data=f"del:{file_id}"),
+         InlineKeyboardButton("❌ تراجع", callback_data="back:subjects")]
+    ])
+    await query.message.reply_text("🗑️ تأكيد الحذف؟ (سيروح للسلة ويمكن استرجاعه)", reply_markup=kb)
 
 async def cb_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    user_id = query.from_user.id
-    file_id = int(query.data.split(":", 1)[1])
-
-    row = get_file_by_id(user_id, file_id)
-    if not row:
-        await query.message.reply_text("❌ الملف غير موجود.")
+    uid = query.from_user.id
+    if not is_admin(uid):
+        await query.message.reply_text("⛔ هذا الخيار للأدمن فقط.")
         return
 
-    delete_file(user_id, file_id)
-    await query.message.reply_text("🗑️ تم حذف الملف من أرشيفك.")
+    file_id = int(query.data.split(":", 1)[1])
+    soft_delete_file(OWNER_ID, file_id)
+    await query.message.reply_text("🗑️ تم نقل الملف إلى السلة (Soft Delete).")
 
+async def cb_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    uid = query.from_user.id
+    if not is_admin(uid):
+        await query.message.reply_text("⛔ هذا الخيار للأدمن فقط.")
+        return
+
+    file_id = int(query.data.split(":", 1)[1])
+    restore_file(OWNER_ID, file_id)
+    await query.message.reply_text("♻️ تم استرجاع الملف.")
 
 async def cb_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     where = query.data.split(":", 1)[1]
     if where == "subjects":
-        kb = subjects_keyboard(query.from_user.id)
-        await query.message.reply_text("📚 موادك (مع عدد الملفات):\n👇 اضغط مادة", reply_markup=kb)
+        kb = subjects_keyboard(OWNER_ID)
+        await query.message.reply_text("📚 المواد:\n👇 اضغط مادة", reply_markup=kb)
     else:
-        await query.message.reply_text("رجعناك للقائمة الرئيسية ✅", reply_markup=MAIN_KB)
+        await query.message.reply_text("✅", reply_markup=MAIN_KB)
 
+# ============================================================
+# ADMIN COMMANDS
+# ============================================================
+async def restore_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ للأدمن فقط.")
+        return
+    msg = restore_from_latest_backup()
+    await update.message.reply_text(msg)
 
-# =========================
+async def purge_trash_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ للأدمن فقط.")
+        return
+    purge_trash(OWNER_ID)
+    await update.message.reply_text("✅ تم تنظيف السلة حسب مدة الاحتفاظ.")
+
+async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ للأدمن فقط.")
+        return
+
+    p_db = Path(DB_PATH)
+    p_files = Path(FILES_DIR)
+    p_bak = Path(BACKUP_DIR)
+
+    msg = (
+        "🧪 Health Check:\n"
+        f"• DB exists: {'✅' if p_db.exists() else '❌'} | size: {p_db.stat().st_size if p_db.exists() else 0}\n"
+        f"• Files dir: {'✅' if p_files.exists() else '❌'}\n"
+        f"• Backups dir: {'✅' if p_bak.exists() else '❌'}\n"
+        f"• Admins: {len(ADMIN_IDS)}\n"
+        f"• Auto backup: {AUTO_BACKUP_MINUTES} min\n"
+    )
+    await update.message.reply_text(msg)
+
+# ============================================================
 # MAIN
-# =========================
+# ============================================================
 def main():
     ensure_dirs()
-    seed_db_if_needed()   # ✅ يرجّع الأرشيف تلقائيًا إذا DB صارت فاضية/اختفت
+
+    # Seed only if DB empty
+    seed_db_if_needed()
+
     init_db()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # ✅ جدولة النسخ الاحتياطي التلقائي
+    # Backup scheduler
     if AUTO_BACKUP_MINUTES > 0:
         app.job_queue.run_repeating(
             auto_backup_job,
@@ -737,19 +894,24 @@ def main():
             first=60,
         )
 
-    # commands
+    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("myid", myid))
+    app.add_handler(CommandHandler("restore_latest", restore_latest))
+    app.add_handler(CommandHandler("purge_trash", purge_trash_cmd))
+    app.add_handler(CommandHandler("health", health))
 
-    # callbacks
+    # Callbacks
     app.add_handler(CallbackQueryHandler(cb_subject, pattern=r"^subj:"))
     app.add_handler(CallbackQueryHandler(cb_open_file, pattern=r"^open:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_fav, pattern=r"^fav:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_del_confirm, pattern=r"^del2:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_del, pattern=r"^del:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_restore, pattern=r"^restore:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_back, pattern=r"^back:"))
 
-    # messages
+    # Messages
     app.add_handler(
         MessageHandler(
             filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE,
@@ -760,7 +922,6 @@ def main():
 
     print("Bot is running...")
     app.run_polling(close_loop=False)
-
 
 if __name__ == "__main__":
     main()
