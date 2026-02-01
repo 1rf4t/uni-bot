@@ -29,23 +29,29 @@ from telegram.ext import (
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# ✅ قاعدة البيانات: لازم تكون بمسار دائم (يفضل /data/archive.db مع Railway Volume)
+# ✅ الأفضل على Railway: استخدم Volume ثم خلي DB_PATH داخل /data
+# مثال: DB_PATH=/data/archive.db
 DB_PATH = os.getenv("DB_PATH", "archive.db").strip()
 
-# ✅ مجلد النسخ الاحتياطية (يفضل /data/backups)
-BACKUP_DIR = os.getenv("BACKUP_DIR", "backups").strip()
+# ✅ ملف "seed" داخل الريبو (النسخة اللي رفعتها على GitHub)
+# إذا archive.db اختفت أو صارت فاضية، راح ينسخ هذا الملف إليها تلقائياً.
+SEED_DB_PATH = os.getenv("SEED_DB_PATH", "archive_backup_20260129_010615.db").strip()
 
-# ✅ حتى يرسل النسخ تلقائياً لك
+# ✅ حتى يرسل لك النسخ الاحتياطية تلقائياً
+# حط رقم حسابك (Telegram user id) كمتغير بيئة OWNER_ID
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
-# ✅ كل كم دقيقة يسوي نسخة تلقائية (60 = كل ساعة)
+# ✅ كل كم دقيقة يسوي نسخة احتياطية تلقائية (مثلاً 60 = كل ساعة)
 AUTO_BACKUP_MINUTES = int(os.getenv("AUTO_BACKUP_MINUTES", "60"))
 
-# ✅ عدد النسخ التي نحتفظ بها فقط (حتى ما يمتلئ التخزين)
-KEEP_BACKUPS = int(os.getenv("KEEP_BACKUPS", "10"))
+# ✅ كم نسخة يحتفظ بها محلياً (إذا عندك /data/backups)
+BACKUP_KEEP = int(os.getenv("BACKUP_KEEP", "20"))
+
+# ✅ مجلد النسخ الاحتياطية (يفضّل داخل /data إذا عندك Volume)
+BACKUP_DIR = os.getenv("BACKUP_DIR", "backups").strip()
 
 if not BOT_TOKEN:
-    raise SystemExit("❌ BOT_TOKEN غير مضبوط. استخدم متغير بيئة BOT_TOKEN")
+    raise SystemExit("❌ BOT_TOKEN غير مضبوط. استخدم: export BOT_TOKEN='xxxxx'")
 
 # موادك الرسمية
 SUBJECTS = [
@@ -84,35 +90,36 @@ MAIN_KB = ReplyKeyboardMarkup(
 )
 
 # =========================
-# PATHS helpers
+# PATH HELPERS
 # =========================
 def ensure_dirs():
-    # إنشاء مجلد قاعدة البيانات إذا كان DB_PATH داخل مجلد
+    # أنشئ مجلد قاعدة البيانات إن كان DB_PATH داخل مجلد (مثل /data/archive.db)
     db_file = Path(DB_PATH)
-    if db_file.parent and str(db_file.parent) != ".":
+    if db_file.parent and str(db_file.parent) not in (".", ""):
         db_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # إنشاء مجلد النسخ الاحتياطية
+    # مجلد النسخ الاحتياطية
     Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
 
-def make_backup_name() -> str:
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    return f"archive_backup_{ts}.db"
 
-def list_backup_files():
-    p = Path(BACKUP_DIR)
-    files = sorted(p.glob("archive_backup_*.db"), key=lambda x: x.stat().st_mtime, reverse=True)
-    return files
+def db_exists_and_not_empty(path: str) -> bool:
+    p = Path(path)
+    return p.exists() and p.is_file() and p.stat().st_size > 10_000  # حجم تقريبي يدل أنه مو فاضي
 
-def cleanup_old_backups():
-    if KEEP_BACKUPS <= 0:
+
+def seed_db_if_needed():
+    """
+    إذا قاعدة البيانات الأساسية غير موجودة أو فاضية،
+    انسخ إليها ملف SEED_DB_PATH الموجود في الريبو.
+    """
+    # إذا DB موجودة وبيها بيانات، لا تسوي شيء
+    if db_exists_and_not_empty(DB_PATH):
         return
-    files = list_backup_files()
-    for f in files[KEEP_BACKUPS:]:
-        try:
-            f.unlink(missing_ok=True)
-        except Exception:
-            pass
+
+    # إذا seed موجود وبي بيانات، انسخه إلى DB_PATH
+    if db_exists_and_not_empty(SEED_DB_PATH):
+        shutil.copy2(SEED_DB_PATH, DB_PATH)
+
 
 # =========================
 # DB
@@ -121,6 +128,7 @@ def db():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     return con
+
 
 def init_db():
     con = db()
@@ -131,8 +139,8 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             subject TEXT NOT NULL,
-            file_type TEXT NOT NULL,
-            tg_file_id TEXT NOT NULL,
+            file_type TEXT NOT NULL,     -- document/photo/video/audio/voice
+            tg_file_id TEXT NOT NULL,    -- Telegram file_id (أفضل للفتح السريع)
             filename TEXT,
             caption TEXT,
             added_at TEXT NOT NULL,
@@ -144,6 +152,7 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_files_user_added ON files(user_id, added_at);")
     con.commit()
     con.close()
+
 
 def add_file(user_id: int, subject: str, file_type: str, tg_file_id: str, filename: str | None, caption: str | None):
     con = db()
@@ -160,13 +169,18 @@ def add_file(user_id: int, subject: str, file_type: str, tg_file_id: str, filena
     con.close()
     return new_id
 
+
 def count_by_subject(user_id: int):
     con = db()
     cur = con.cursor()
-    cur.execute("SELECT subject, COUNT(*) cnt FROM files WHERE user_id=? GROUP BY subject", (user_id,))
+    cur.execute(
+        "SELECT subject, COUNT(*) cnt FROM files WHERE user_id=? GROUP BY subject",
+        (user_id,),
+    )
     rows = cur.fetchall()
     con.close()
     return [(r[0], r[1]) for r in rows]
+
 
 def list_files_by_subject(user_id: int, subject: str, limit: int = 50):
     con = db()
@@ -185,6 +199,7 @@ def list_files_by_subject(user_id: int, subject: str, limit: int = 50):
     con.close()
     return rows
 
+
 def get_file_by_id(user_id: int, file_id: int):
     con = db()
     cur = con.cursor()
@@ -200,6 +215,7 @@ def get_file_by_id(user_id: int, file_id: int):
     con.close()
     return row
 
+
 def set_fav(user_id: int, file_id: int, fav: int):
     con = db()
     cur = con.cursor()
@@ -207,12 +223,14 @@ def set_fav(user_id: int, file_id: int, fav: int):
     con.commit()
     con.close()
 
+
 def delete_file(user_id: int, file_id: int):
     con = db()
     cur = con.cursor()
     cur.execute("DELETE FROM files WHERE user_id=? AND id=?", (user_id, file_id))
     con.commit()
     con.close()
+
 
 def list_recent(user_id: int, limit: int = 10):
     con = db()
@@ -231,6 +249,7 @@ def list_recent(user_id: int, limit: int = 10):
     con.close()
     return rows
 
+
 def list_favorites(user_id: int, limit: int = 50):
     con = db()
     cur = con.cursor()
@@ -247,6 +266,7 @@ def list_favorites(user_id: int, limit: int = 50):
     rows = cur.fetchall()
     con.close()
     return rows
+
 
 def search_files(user_id: int, q: str, limit: int = 30):
     like = f"%{q}%"
@@ -267,47 +287,88 @@ def search_files(user_id: int, q: str, limit: int = 30):
     con.close()
     return rows
 
+
 # =========================
 # BACKUP (SAFE)
 # =========================
-def create_backup_file() -> Path:
+def make_backup_name() -> str:
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    return f"archive_backup_{ts}.db"
+
+
+def make_sqlite_backup(dest_path: str):
     """
-    ✅ نسخ آمن للـ SQLite: نعمل copy للملف الحالي إلى BACKUP_DIR
+    نسخة احتياطية آمنة باستخدام sqlite backup API
+    أفضل من copy المباشر أثناء الكتابة.
     """
-    backup_name = make_backup_name()
-    backup_path = Path(BACKUP_DIR) / backup_name
+    src = sqlite3.connect(DB_PATH)
+    dst = sqlite3.connect(dest_path)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
 
-    # إذا DB غير موجود، نمنع الخطأ
-    if not Path(DB_PATH).exists():
-        raise FileNotFoundError(f"DB not found: {DB_PATH}")
 
-    shutil.copy2(DB_PATH, backup_path)
-    cleanup_old_backups()
-    return backup_path
+def cleanup_old_backups():
+    """
+    يحذف أقدم النسخ إذا تجاوزت BACKUP_KEEP
+    """
+    if BACKUP_KEEP <= 0:
+        return
 
-async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    bdir = Path(BACKUP_DIR)
+    files = sorted(bdir.glob("archive_backup_*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for p in files[BACKUP_KEEP:]:
+        try:
+            p.unlink()
+        except Exception:
+            pass
+
+
+async def send_backup_to_owner(context: ContextTypes.DEFAULT_TYPE, backup_path: Path, caption: str):
     if OWNER_ID == 0:
         return
     try:
-        backup_path = create_backup_file()
         with open(backup_path, "rb") as f:
             await context.bot.send_document(
                 chat_id=OWNER_ID,
                 document=f,
                 filename=backup_path.name,
-                caption="✅ نسخة احتياطية تلقائية (Auto Backup)",
+                caption=caption,
             )
+    except Exception as e:
+        try:
+            await context.bot.send_message(chat_id=OWNER_ID, text=f"❌ فشل إرسال النسخة الاحتياطية: {e}")
+        except Exception:
+            pass
+
+
+async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    if OWNER_ID == 0:
+        return
+
+    try:
+        backup_name = make_backup_name()
+        backup_path = Path(BACKUP_DIR) / backup_name
+
+        make_sqlite_backup(str(backup_path))
+        cleanup_old_backups()
+
+        await send_backup_to_owner(context, backup_path, "✅ نسخة احتياطية تلقائية من قاعدة البيانات")
     except Exception as e:
         try:
             await context.bot.send_message(chat_id=OWNER_ID, text=f"❌ فشل النسخ الاحتياطي التلقائي: {e}")
         except Exception:
             pass
 
+
 # =========================
 # UI Helpers
 # =========================
 def subjects_keyboard(user_id: int):
     counts = dict(count_by_subject(user_id))
+
     items = []
     for s in SUBJECTS:
         emoji = SUBJECT_EMOJI.get(s, "📘")
@@ -320,6 +381,7 @@ def subjects_keyboard(user_id: int):
 
     buttons.append([InlineKeyboardButton("↩️ رجوع", callback_data="back:home")])
     return InlineKeyboardMarkup(buttons)
+
 
 def files_keyboard(subject: str, rows):
     items = []
@@ -342,11 +404,13 @@ def files_keyboard(subject: str, rows):
     buttons.append([InlineKeyboardButton("↩️ رجوع للمواد", callback_data="back:subjects")])
     return InlineKeyboardMarkup(buttons)
 
+
 def manage_keyboard(file_id: int, is_fav: int):
     fav_btn = InlineKeyboardButton("⭐ إزالة من المفضلة" if is_fav else "⭐ إضافة للمفضلة", callback_data=f"fav:{file_id}")
     del_btn = InlineKeyboardButton("🗑️ حذف", callback_data=f"del:{file_id}")
     back_btn = InlineKeyboardButton("↩️ رجوع للمواد", callback_data="back:subjects")
     return InlineKeyboardMarkup([[fav_btn, del_btn], [back_btn]])
+
 
 def pretty_file_line(r):
     subj = r["subject"]
@@ -354,6 +418,7 @@ def pretty_file_line(r):
     name = (r["filename"] or "").strip() or (r["caption"] or f"file_{r['id']}")
     fav = "⭐" if r["is_fav"] else ""
     return f"{fav}{emoji} <b>{subj}</b> | #{r['id']} | {name} | {r['added_at']}"
+
 
 # =========================
 # Bot Handlers
@@ -373,6 +438,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, reply_markup=MAIN_KB)
 
+
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    await update.message.reply_text(f"🆔 Your Telegram ID:\n<code>{uid}</code>", parse_mode=ParseMode.HTML)
+
+
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "ℹ️ مساعدة:\n"
@@ -381,13 +452,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• لفتح ملف: ادخل المادة واضغط اسم الملف من القائمة.\n"
         "• ⭐ المفضلة: ملفاتك المميزة.\n"
         "• 🧾 آخر الملفات: آخر ما حفظته.\n"
-        "• 📦 نسخة احتياطية: Backup يدوي يوصلك.\n",
+        "• 📦 نسخة احتياطية: Backup يدوي.\n"
+        "• النسخ التلقائي: يعتمد على AUTO_BACKUP_MINUTES.\n",
         reply_markup=MAIN_KB,
     )
 
-# (اختياري) حتى تجيب رقم ايديك بسهولة
-async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🆔 Your Telegram ID: {update.effective_user.id}", reply_markup=MAIN_KB)
 
 def normalize_subject(text: str):
     t = text.strip()
@@ -395,6 +464,7 @@ def normalize_subject(text: str):
         if t.lower() == s.lower():
             return s
     return None
+
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
@@ -411,6 +481,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=MAIN_KB)
         return
 
+    # أوامر من الأزرار
     if text == "📚 المواد":
         kb = subjects_keyboard(update.effective_user.id)
         await update.message.reply_text("📚 موادك (مع عدد الملفات):\n👇 اضغط مادة", reply_markup=kb)
@@ -439,24 +510,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔎 اكتب كلمة من اسم الملف أو الوصف:", reply_markup=MAIN_KB)
         return
 
-    # ✅ نسخة احتياطية يدوية صحيحة (تعمل نسخة فعلية وترسلها)
+    # نسخة احتياطية يدوية
     if text == "📦 نسخة احتياطية":
         try:
-            backup_path = create_backup_file()
+            backup_name = make_backup_name()
+            backup_path = Path(BACKUP_DIR) / backup_name
+
+            make_sqlite_backup(str(backup_path))
+            cleanup_old_backups()
+
             with open(backup_path, "rb") as f:
                 await update.message.reply_document(
                     document=f,
-                    filename=backup_path.name,
-                    caption="📦 نسخة احتياطية من قاعدة البيانات",
+                    filename=backup_name,
+                    caption="📦 نسخة احتياطية من قاعدة البيانات"
                 )
         except Exception as e:
-            await update.message.reply_text(f"❌ فشل النسخ الاحتياطي: {e}", reply_markup=MAIN_KB)
+            await update.message.reply_text(f"❌ فشل النسخ الاحتياطي: {e}")
         return
 
     if text == "ℹ️ مساعدة":
         await help_cmd(update, context)
         return
 
+    # تثبيت مادة سريع بالكتابة
     subj = normalize_subject(text)
     if subj:
         context.user_data["fixed_subject"] = subj
@@ -473,6 +550,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("ما فهمت 😅\nاضغط من القائمة: 📚 المواد أو اكتب اسم المادة لتثبيتها.", reply_markup=MAIN_KB)
 
+
 def get_fixed_subject(context: ContextTypes.DEFAULT_TYPE):
     subj = context.user_data.get("fixed_subject")
     until = context.user_data.get("fixed_until", 0)
@@ -481,6 +559,7 @@ def get_fixed_subject(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("fixed_subject", None)
     context.user_data.pop("fixed_until", None)
     return None
+
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -533,6 +612,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=MAIN_KB,
     )
 
+
 # =========================
 # Callbacks
 # =========================
@@ -553,6 +633,7 @@ async def cb_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = files_keyboard(subject, rows)
     await query.message.reply_text(f"{emoji} <b>{subject}</b> — اختر ملف لفتحه:", parse_mode=ParseMode.HTML, reply_markup=kb)
 
+
 async def cb_open_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -565,6 +646,8 @@ async def cb_open_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("❌ الملف غير موجود أو تم حذفه.")
         return
 
+    subj = row["subject"]
+    emoji = SUBJECT_EMOJI.get(subj, "📘")
     filename = (row["filename"] or "").strip() or f"file_{file_id}"
     caption = row["caption"] or None
     is_fav = int(row["is_fav"])
@@ -583,13 +666,12 @@ async def cb_open_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("⚠️ نوع الملف غير مدعوم.")
         return
 
-    subj = row["subject"]
-    emoji = SUBJECT_EMOJI.get(subj, "📘")
     await query.message.reply_text(
         f"⚙️ <b>إدارة الملف</b>:\n{emoji} {subj} | #{file_id}\n📄 {filename}",
         parse_mode=ParseMode.HTML,
         reply_markup=manage_keyboard(file_id, is_fav),
     )
+
 
 async def cb_fav(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -608,6 +690,7 @@ async def cb_fav(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text("⭐ تم تحديث المفضلة.")
     await query.message.reply_text("⚙️ إدارة الملف:", reply_markup=manage_keyboard(file_id, new_fav))
 
+
 async def cb_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -623,6 +706,7 @@ async def cb_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     delete_file(user_id, file_id)
     await query.message.reply_text("🗑️ تم حذف الملف من أرشيفك.")
 
+
 async def cb_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -634,11 +718,13 @@ async def cb_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await query.message.reply_text("رجعناك للقائمة الرئيسية ✅", reply_markup=MAIN_KB)
 
+
 # =========================
 # MAIN
 # =========================
 def main():
     ensure_dirs()
+    seed_db_if_needed()   # ✅ يرجّع الأرشيف تلقائيًا إذا DB صارت فاضية/اختفت
     init_db()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -674,6 +760,7 @@ def main():
 
     print("Bot is running...")
     app.run_polling(close_loop=False)
+
 
 if __name__ == "__main__":
     main()
