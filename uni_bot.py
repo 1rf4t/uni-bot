@@ -671,19 +671,21 @@ def pretty_file_line(r):
 # ============================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    uid = update.effective_user.id
 
-    role = "👑 Admin" if is_admin(uid) else "👀 Viewer"
     text = (
-        f"يا هلا 👋\n"
-        f"وضعك الحالي: <b>{role}</b>\n"
-        f"LIBRARY_ID: <code>{LIBRARY_ID}</code>\n\n"
-        "📚 هذا بوت أرشفة للجامعة.\n"
-        "• الطلاب: تصفّح فقط.\n"
-        "• الأدمن: يضيف/يحذف/يسوي Backup.\n\n"
-        "اضغط من القائمة 👇"
+        "👋 أهلاً وسهلاً بك\n\n"
+        "هذا بوت أرشفة خاص بمواد الجامعة 📚  \n"
+        "يتيح لك تصفّح المواد والملفات الدراسية بسهولة وسرعة.\n\n"
+        "✨ المميزات:\n"
+        "🔹 ملفات منظّمة حسب المادة\n"
+        "🔹 واجهة بسيطة وسهلة الاستخدام\n"
+        "🔹 تحميل مباشر \n"
+        "🔹 تصفح الملفات بسهولة \n\n"
+        "⬇️\n"
+        "اضغط من القائمة واختر المادة التي تريدها"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=MAIN_KB)
+
+    await update.message.reply_text(text, reply_markup=MAIN_KB)
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
