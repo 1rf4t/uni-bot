@@ -155,6 +155,7 @@ def init_db():
             subject TEXT NOT NULL,
             file_type TEXT NOT NULL,
             tg_file_id TEXT NOT NULL,
+            tg_unique_id TEXT,                 -- ✅ NEW: For de-duplication
             filename TEXT,
             caption TEXT,
             local_path TEXT,
@@ -167,7 +168,6 @@ def init_db():
     )
 
     # ✅ MIGRATION: دعم قواعد بيانات قديمة (بدون تخريب)
-    # إذا جدول files قديم وناقص أعمدة، نضيفها
     try:
         cur.execute("PRAGMA table_info(files)")
         cols = {row[1] for row in cur.fetchall()}
@@ -180,13 +180,20 @@ def init_db():
             cur.execute("ALTER TABLE files ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
         if "deleted_at" not in cols:
             cur.execute("ALTER TABLE files ADD COLUMN deleted_at TEXT")
+
+        # ✅ NEW migration: add tg_unique_id
+        if "tg_unique_id" not in cols:
+            cur.execute("ALTER TABLE files ADD COLUMN tg_unique_id TEXT")
     except Exception:
         pass
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_files_user_subject ON files(user_id, subject);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_files_user_added ON files(user_id, added_at);")
-    # هذا الاندكس ما يضر حتى لو العمود جديد (المigration يضمن وجوده)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_files_deleted ON files(user_id, is_deleted);")
+
+    # ✅ NEW: unique index for de-duplication
+    # Note: SQLite يسمح بتكرار NULL، لذلك نحاول دائماً نخزن قيمة غير فارغة.
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_user_unique ON files(user_id, tg_unique_id);")
 
     con.commit()
     con.close()
@@ -222,26 +229,29 @@ def _has_is_deleted_column() -> bool:
     except Exception:
         return False
 
+def _has_unique_column() -> bool:
+    try:
+        con = db()
+        cur = con.cursor()
+        cur.execute("PRAGMA table_info(files)")
+        cols = {row[1] for row in cur.fetchall()}
+        con.close()
+        return "tg_unique_id" in cols
+    except Exception:
+        return False
+
 # ✅ detect library id from DB content (modern)
 def detect_library_id() -> int:
-    """
-    يرجع user_id اللي فعلاً عنده ملفات داخل الـ DB (غير محذوفة).
-    - لو OWNER_ID عنده ملفات => يرجعه
-    - إذا لا، يرجع أول user_id الأكثر ملفات
-    - إذا DB فارغ => 0
-    """
     try:
         con = db()
         cur = con.cursor()
 
-        # if OWNER_ID already has rows, use it
         if OWNER_ID:
             cur.execute("SELECT COUNT(*) FROM files WHERE user_id=? AND is_deleted=0", (OWNER_ID,))
             if cur.fetchone()[0] > 0:
                 con.close()
                 return OWNER_ID
 
-        # otherwise pick the user_id with most files
         cur.execute(
             """
             SELECT user_id, COUNT(*) AS cnt
@@ -262,10 +272,6 @@ def detect_library_id() -> int:
 
 # ✅ legacy-safe detector (works even if DB is older)
 def detect_library_id_legacy() -> int:
-    """
-    نسخة احتياطية من detect_library_id
-    تشتغل حتى لو DB قديمة وما بيها is_deleted
-    """
     try:
         con = db()
         cur = con.cursor()
@@ -274,7 +280,6 @@ def detect_library_id_legacy() -> int:
         cols = {row[1] for row in cur.fetchall()}
         has_deleted = "is_deleted" in cols
 
-        # 1) إذا OWNER_ID عنده ملفات استخدمه
         if OWNER_ID:
             if has_deleted:
                 cur.execute("SELECT COUNT(*) FROM files WHERE user_id=? AND is_deleted=0", (OWNER_ID,))
@@ -284,7 +289,6 @@ def detect_library_id_legacy() -> int:
                 con.close()
                 return OWNER_ID
 
-        # 2) غير ذلك: جيب أكثر user_id عنده ملفات
         if has_deleted:
             cur.execute("""
                 SELECT user_id, COUNT(*) AS cnt
@@ -329,21 +333,64 @@ def library_has_any_files(user_id: int) -> bool:
     except Exception:
         return False
 
-def add_file_row(user_id: int, subject: str, file_type: str, tg_file_id: str,
-                 filename: str | None, caption: str | None, local_path: str | None):
+def add_file_row(
+    user_id: int,
+    subject: str,
+    file_type: str,
+    tg_file_id: str,
+    tg_unique_id: str | None,
+    filename: str | None,
+    caption: str | None,
+    local_path: str | None
+):
     con = db()
     cur = con.cursor()
     cur.execute(
         """
-        INSERT INTO files (user_id, subject, file_type, tg_file_id, filename, caption, local_path, added_at, is_fav, is_deleted)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
+        INSERT INTO files (user_id, subject, file_type, tg_file_id, tg_unique_id, filename, caption, local_path, added_at, is_fav, is_deleted)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
         """,
-        (user_id, subject, file_type, tg_file_id, filename, caption, local_path, utcnow_str()),
+        (user_id, subject, file_type, tg_file_id, tg_unique_id, filename, caption, local_path, utcnow_str()),
     )
     con.commit()
     new_id = cur.lastrowid
     con.close()
     return new_id
+
+def get_file_by_unique(user_id: int, tg_unique_id: str):
+    if not tg_unique_id:
+        return None
+    con = db()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT * FROM files WHERE user_id=? AND tg_unique_id=? LIMIT 1",
+        (user_id, tg_unique_id),
+    )
+    row = cur.fetchone()
+    con.close()
+    return row
+
+def update_existing_file_from_duplicate(user_id: int, existing_id: int, tg_file_id: str, filename: str | None, caption: str | None, local_path: str | None):
+    """
+    إذا الملف كان موجود (خصوصاً إذا كان محذوف)، نحدّث بياناته ونرجّعه.
+    """
+    con = db()
+    cur = con.cursor()
+    cur.execute(
+        """
+        UPDATE files
+        SET tg_file_id=?,
+            filename=COALESCE(?, filename),
+            caption=COALESCE(?, caption),
+            local_path=COALESCE(?, local_path),
+            is_deleted=0,
+            deleted_at=NULL
+        WHERE user_id=? AND id=?
+        """,
+        (tg_file_id, filename, caption, local_path, user_id, existing_id),
+    )
+    con.commit()
+    con.close()
 
 def count_by_subject(user_id: int):
     con = db()
@@ -420,8 +467,6 @@ def set_fav(user_id: int, file_id: int, fav: int):
 def soft_delete_file(user_id: int, file_id: int):
     con = db()
     cur = con.cursor()
-
-    # إذا DB قديمة وما بيها is_deleted، migration داخل init_db يضمن وجوده
     cur.execute(
         "UPDATE files SET is_deleted=1, deleted_at=? WHERE user_id=? AND id=?",
         (utcnow_str(), user_id, file_id),
@@ -539,8 +584,6 @@ def purge_trash(user_id: int):
     cutoff = datetime.utcnow() - timedelta(days=TRASH_RETENTION_DAYS)
     con = db()
     cur = con.cursor()
-
-    # لو DB قديمة، migration يضمن وجود deleted_at و is_deleted
     cur.execute(
         "DELETE FROM files WHERE user_id=? AND is_deleted=1 AND deleted_at < ?",
         (user_id, cutoff.isoformat(timespec="seconds")),
@@ -600,10 +643,8 @@ async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
         make_sqlite_backup(str(backup_path))
         cleanup_old_backups()
 
-        # ✅ Silent mode
         if not SILENT_BACKUP_TO_OWNER:
             await send_backup_to_owner(context, backup_path, "✅ Auto-backup (DB)")
-
     except Exception:
         pass
 
@@ -805,6 +846,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("ما فهمت 😅\nاضغط 📚 المواد أو 🔎 بحث.", reply_markup=MAIN_KB)
 
+def extract_tg_unique_id(message) -> str | None:
+    """
+    ✅ يرجّع file_unique_id حسب نوع الرسالة.
+    إذا ما متوفر، يرجّع fallback مبني على file_id حتى لا يكون NULL.
+    """
+    try:
+        if message.document:
+            return message.document.file_unique_id
+        if message.photo:
+            return message.photo[-1].file_unique_id
+        if message.video:
+            return message.video.file_unique_id
+        if message.audio:
+            return message.audio.file_unique_id
+        if message.voice:
+            return message.voice.file_unique_id
+    except Exception:
+        pass
+    return None
+
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_admin(uid):
@@ -847,6 +908,35 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ نوع غير مدعوم.", reply_markup=MAIN_KB)
         return
 
+    # ✅ NEW: get unique id for de-dup
+    tg_unique_id = extract_tg_unique_id(msg)
+    if not tg_unique_id:
+        # fallback avoids NULL duplicates (not perfect across re-uploads, but prevents NULL spam)
+        tg_unique_id = f"{file_type}:{tg_file_id}"
+
+    # ✅ NEW: check duplicate BEFORE downloading/saving
+    existing = get_file_by_unique(LIBRARY_ID, tg_unique_id)
+    if existing:
+        try:
+            ex_id = int(existing["id"])
+            ex_deleted = int(existing["is_deleted"]) if ("is_deleted" in existing.keys() and existing["is_deleted"] is not None) else 0
+            ex_subj = existing["subject"]
+        except Exception:
+            ex_id = None
+            ex_deleted = 0
+            ex_subj = subj
+
+        # إذا موجود وغير محذوف => رفض
+        if ex_deleted == 0:
+            await update.message.reply_text(
+                "⚠️ هذا الملف موجود مسبقاً بالمكتبة.\n"
+                f"• المادة: {ex_subj}\n"
+                f"• رقم الملف: #{ex_id}\n"
+                "✅ ما راح أضيف نسخة ثانية.",
+                reply_markup=MAIN_KB,
+            )
+            return
+
     emoji = SUBJECT_EMOJI.get(subj, "📘")
     subject_dir = Path(FILES_DIR) / subj
     subject_dir.mkdir(parents=True, exist_ok=True)
@@ -855,21 +945,55 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     safe_name = safe_filename(orig_name, f"{file_type}_{ts}")
     local_path = subject_dir / f"{ts}_{safe_name}"
 
+    # نحاول نخزن محلياً
     try:
         tg_file = await context.bot.get_file(tg_file_id)
         await tg_file.download_to_drive(custom_path=str(local_path))
     except Exception:
         local_path = None
 
-    new_id = add_file_row(
-        user_id=LIBRARY_ID,
-        subject=subj,
-        file_type=file_type,
-        tg_file_id=tg_file_id,
-        filename=safe_name,
-        caption=caption,
-        local_path=str(local_path) if local_path else None
-    )
+    # ✅ إذا موجود لكنه محذوف => رجّعه بدل إضافة نسخة جديدة
+    if existing:
+        ex_id = int(existing["id"])
+        update_existing_file_from_duplicate(
+            user_id=LIBRARY_ID,
+            existing_id=ex_id,
+            tg_file_id=tg_file_id,
+            filename=safe_name,
+            caption=caption,
+            local_path=str(local_path) if local_path else None,
+        )
+        await update.message.reply_text(
+            "♻️ هذا الملف كان موجود بالسلة وتم استرجاعه بدل ما نضيف نسخة مكررة.\n"
+            f"{emoji} {subj}\n"
+            f"رقم: #{ex_id}\n"
+            f"تم الحفظ المحلي: {'✅' if local_path else '⚠️ لا (اعتماد على تيليجرام)'}",
+            reply_markup=MAIN_KB,
+        )
+        return
+
+    # ✅ إدخال جديد (ليس مكرر)
+    try:
+        new_id = add_file_row(
+            user_id=LIBRARY_ID,
+            subject=subj,
+            file_type=file_type,
+            tg_file_id=tg_file_id,
+            tg_unique_id=tg_unique_id,
+            filename=safe_name,
+            caption=caption,
+            local_path=str(local_path) if local_path else None
+        )
+    except sqlite3.IntegrityError:
+        # في حالة سباق (رسل نفس الملف مرتين بسرعة) — القيد الفريد يمنع ويطلع هنا
+        ex = get_file_by_unique(LIBRARY_ID, tg_unique_id)
+        ex_id = int(ex["id"]) if ex else "?"
+        await update.message.reply_text(
+            "⚠️ تكرار (منعته قاعدة البيانات).\n"
+            f"رقم الملف الموجود: #{ex_id}",
+            reply_markup=MAIN_KB,
+        )
+        return
 
     await update.message.reply_text(
         f"✅ تمت الإضافة للمكتبة العامة!\n"
@@ -909,7 +1033,6 @@ async def cb_open_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("❌ الملف غير موجود.")
         return
 
-    # إذا عندنا is_deleted
     if _has_is_deleted_column():
         try:
             if int(row["is_deleted"]) == 1:
@@ -968,7 +1091,6 @@ async def cb_open_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"❌ تعذر إرسال الملف: {e}")
             return
 
-    # إدارة/عرض
     if is_admin(uid):
         is_fav_val = int(row["is_fav"]) if "is_fav" in row.keys() else 0
         is_deleted_val = int(row["is_deleted"]) if ("is_deleted" in row.keys() and row["is_deleted"] is not None) else 0
@@ -1067,7 +1189,6 @@ async def restore_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = restore_from_latest_backup()
     await update.message.reply_text(msg)
 
-    # بعد الاسترجاع، حاول نحدد المكتبة من جديد (إذا LIBRARY_ID مو محدد بالENV)
     global LIBRARY_ID
     detected = detect_library_id_legacy() or detect_library_id()
     if detected:
@@ -1094,7 +1215,6 @@ async def restore_seed(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         shutil.copy2(str(seed), DB_PATH)
-        # مهم: بعد النسخ، سوّي init_db حتى يعمل migration لو DB قديمة
         init_db()
 
         global LIBRARY_ID
@@ -1138,10 +1258,10 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• LIBRARY_ID: {LIBRARY_ID}\n"
         f"• OWNER_ID: {OWNER_ID}\n"
         f"• SEED_DB_PATH: {SEED_DB_PATH or '(empty)'}\n"
+        f"• De-dup column: {'✅' if _has_unique_column() else '❌'}\n"
     )
     await update.message.reply_text(msg)
 
-# ✅ NEW: show current library id
 async def library_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_admin(uid):
@@ -1149,7 +1269,6 @@ async def library_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(f"📚 LIBRARY_ID الحالي: <code>{LIBRARY_ID}</code>", parse_mode=ParseMode.HTML)
 
-# ✅ NEW: adopt library automatically from DB
 async def adopt_library(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_admin(uid):
@@ -1179,17 +1298,14 @@ def main():
     seed_db_if_needed()
     init_db()
 
-    # ✅ Auto-detect library id if not provided
     global LIBRARY_ID
     if LIBRARY_ID == 0:
         detected = detect_library_id_legacy() or detect_library_id()
         if detected:
             LIBRARY_ID = detected
-        # fallback: if still 0, default to OWNER_ID (empty library case)
         if LIBRARY_ID == 0 and OWNER_ID:
             LIBRARY_ID = OWNER_ID
 
-    # ✅ FIX: إذا الـ LIBRARY_ID الحالي ما يملك ملفات لكن DB فيها ملفات لمستخدم آخر
     if LIBRARY_ID and not library_has_any_files(LIBRARY_ID):
         detected2 = detect_library_id_legacy() or detect_library_id()
         if detected2:
@@ -1197,7 +1313,6 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Backup scheduler
     if AUTO_BACKUP_MINUTES > 0:
         app.job_queue.run_repeating(
             auto_backup_job,
@@ -1213,8 +1328,6 @@ def main():
     app.add_handler(CommandHandler("restore_seed", restore_seed))
     app.add_handler(CommandHandler("purge_trash", purge_trash_cmd))
     app.add_handler(CommandHandler("health", health))
-
-    # ✅ NEW commands
     app.add_handler(CommandHandler("library", library_cmd))
     app.add_handler(CommandHandler("adopt_library", adopt_library))
 
