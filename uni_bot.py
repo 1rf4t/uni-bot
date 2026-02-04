@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+from __future__ import annotations
+
 import os
 import re
 import sqlite3
@@ -32,24 +34,18 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise SystemExit("❌ BOT_TOKEN غير مضبوط")
 
-# ⚠️ أهم شيء للاحتراف: خزن داخل Volume (Railway volume)
 DB_PATH = os.getenv("DB_PATH", "/data/archive.db").strip()
-
 FILES_DIR = os.getenv("FILES_DIR", "/data/files").strip()
 BACKUP_DIR = os.getenv("BACKUP_DIR", "/data/backups").strip()
 
-# نسخة Seed (اختياري) إذا تريد ترجع بيانات أول مرة
 SEED_DB_PATH = os.getenv("SEED_DB_PATH", "").strip()  # مثال: "/app/archive_backup_20260129_010615.db"
 
-# Admins / Owner (هذا الشخص يتعامل كأدمن، وتروح له النسخ الاحتياطية)
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
-# ✅ NEW: LIBRARY OWNER (هوية المكتبة داخل الـ DB)
-# إذا ما محددها، نخليها تتحدد لاحقاً تلقائياً من محتوى الـ DB
-LIBRARY_ID_ENV = os.getenv("LIBRARY_ID", "").strip()  # optional
-LIBRARY_ID = int(LIBRARY_ID_ENV) if LIBRARY_ID_ENV.isdigit() else 0  # will be auto-detected if 0
+LIBRARY_ID_ENV = os.getenv("LIBRARY_ID", "").strip()
+LIBRARY_ID = int(LIBRARY_ID_ENV) if LIBRARY_ID_ENV.isdigit() else 0
 
-ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()  # "123,456"
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "").strip()
 ADMIN_IDS = set()
 if ADMIN_IDS_RAW:
     for x in ADMIN_IDS_RAW.split(","):
@@ -59,17 +55,13 @@ if ADMIN_IDS_RAW:
 if OWNER_ID:
     ADMIN_IDS.add(OWNER_ID)
 
-# Backup scheduler
 AUTO_BACKUP_MINUTES = int(os.getenv("AUTO_BACKUP_MINUTES", "60"))
 BACKUP_KEEP = int(os.getenv("BACKUP_KEEP", "30"))
 
-# ✅ NEW: Silent auto-backup toggle
 SILENT_BACKUP_TO_OWNER = os.getenv("SILENT_BACKUP_TO_OWNER", "false").strip().lower() == "true"
 
-# Delete / Trash
 TRASH_RETENTION_DAYS = int(os.getenv("TRASH_RETENTION_DAYS", "30"))
 
-# Subjects
 SUBJECTS = [
     "Poetry",
     "Writing",
@@ -94,7 +86,6 @@ SUBJECT_EMOJI = {
     "Listening and speaking": "🎧",
 }
 
-# Main keyboard (Reply)
 MAIN_KB = ReplyKeyboardMarkup(
     [
         [KeyboardButton("📚 المواد"), KeyboardButton("🧾 آخر الملفات")],
@@ -105,7 +96,7 @@ MAIN_KB = ReplyKeyboardMarkup(
 )
 
 # ============================================================
-# PATH / UTIL
+# UTIL
 # ============================================================
 def utcnow_str():
     return datetime.utcnow().isoformat(timespec="seconds")
@@ -122,7 +113,6 @@ def safe_filename(name: str, fallback: str) -> str:
     name = (name or "").strip()
     if not name:
         return fallback
-    # remove weird chars
     name = re.sub(r"[^\w\-. ()\[\]{}]+", "_", name, flags=re.UNICODE)
     name = name.strip(" ._")
     return name or fallback
@@ -142,11 +132,21 @@ def db():
     con.row_factory = sqlite3.Row
     return con
 
+def has_unique_index() -> bool:
+    try:
+        con = db()
+        cur = con.cursor()
+        cur.execute("PRAGMA index_list(files)")
+        names = [r[1] for r in cur.fetchall()]  # column 1 = name
+        con.close()
+        return "idx_files_user_unique" in names
+    except Exception:
+        return False
+
 def init_db():
     con = db()
     cur = con.cursor()
 
-    # ✅ create table (new schema)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS files (
@@ -155,7 +155,7 @@ def init_db():
             subject TEXT NOT NULL,
             file_type TEXT NOT NULL,
             tg_file_id TEXT NOT NULL,
-            tg_unique_id TEXT,                 -- ✅ NEW: For de-duplication
+            tg_unique_id TEXT,
             filename TEXT,
             caption TEXT,
             local_path TEXT,
@@ -167,7 +167,7 @@ def init_db():
         """
     )
 
-    # ✅ MIGRATION: دعم قواعد بيانات قديمة (بدون تخريب)
+    # MIGRATION
     try:
         cur.execute("PRAGMA table_info(files)")
         cols = {row[1] for row in cur.fetchall()}
@@ -180,20 +180,33 @@ def init_db():
             cur.execute("ALTER TABLE files ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
         if "deleted_at" not in cols:
             cur.execute("ALTER TABLE files ADD COLUMN deleted_at TEXT")
-
-        # ✅ NEW migration: add tg_unique_id
         if "tg_unique_id" not in cols:
             cur.execute("ALTER TABLE files ADD COLUMN tg_unique_id TEXT")
     except Exception:
         pass
 
+    # indexes
     cur.execute("CREATE INDEX IF NOT EXISTS idx_files_user_subject ON files(user_id, subject);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_files_user_added ON files(user_id, added_at);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_files_deleted ON files(user_id, is_deleted);")
 
-    # ✅ NEW: unique index for de-duplication
-    # Note: SQLite يسمح بتكرار NULL، لذلك نحاول دائماً نخزن قيمة غير فارغة.
-    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_user_unique ON files(user_id, tg_unique_id);")
+    # ✅ HARD de-dup enforcement
+    # حاول تنشئ unique index، إذا فشل بسبب تكرارات قديمة -> نظّف ثم أعد المحاولة
+    try:
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_user_unique ON files(user_id, tg_unique_id);")
+    except sqlite3.IntegrityError:
+        # حذف الزائد وخلي أحدث id فقط لكل (user_id, tg_unique_id)
+        cur.execute("""
+            DELETE FROM files
+            WHERE id NOT IN (
+                SELECT MAX(id)
+                FROM files
+                WHERE tg_unique_id IS NOT NULL AND tg_unique_id != ''
+                GROUP BY user_id, tg_unique_id
+            )
+            AND tg_unique_id IS NOT NULL AND tg_unique_id != '';
+        """)
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_user_unique ON files(user_id, tg_unique_id);")
 
     con.commit()
     con.close()
@@ -218,64 +231,10 @@ def seed_db_if_needed():
     if seed.exists() and seed.is_file() and seed.stat().st_size > 10_000:
         shutil.copy2(str(seed), DB_PATH)
 
-def _has_is_deleted_column() -> bool:
-    try:
-        con = db()
-        cur = con.cursor()
-        cur.execute("PRAGMA table_info(files)")
-        cols = {row[1] for row in cur.fetchall()}
-        con.close()
-        return "is_deleted" in cols
-    except Exception:
-        return False
-
-def _has_unique_column() -> bool:
-    try:
-        con = db()
-        cur = con.cursor()
-        cur.execute("PRAGMA table_info(files)")
-        cols = {row[1] for row in cur.fetchall()}
-        con.close()
-        return "tg_unique_id" in cols
-    except Exception:
-        return False
-
-# ✅ detect library id from DB content (modern)
-def detect_library_id() -> int:
-    try:
-        con = db()
-        cur = con.cursor()
-
-        if OWNER_ID:
-            cur.execute("SELECT COUNT(*) FROM files WHERE user_id=? AND is_deleted=0", (OWNER_ID,))
-            if cur.fetchone()[0] > 0:
-                con.close()
-                return OWNER_ID
-
-        cur.execute(
-            """
-            SELECT user_id, COUNT(*) AS cnt
-            FROM files
-            WHERE is_deleted=0
-            GROUP BY user_id
-            ORDER BY cnt DESC
-            LIMIT 1
-            """
-        )
-        row = cur.fetchone()
-        con.close()
-        if row:
-            return int(row[0])
-        return 0
-    except Exception:
-        return 0
-
-# ✅ legacy-safe detector (works even if DB is older)
 def detect_library_id_legacy() -> int:
     try:
         con = db()
         cur = con.cursor()
-
         cur.execute("PRAGMA table_info(files)")
         cols = {row[1] for row in cur.fetchall()}
         has_deleted = "is_deleted" in cols
@@ -309,9 +268,7 @@ def detect_library_id_legacy() -> int:
 
         row = cur.fetchone()
         con.close()
-        if row:
-            return int(row[0])
-        return 0
+        return int(row[0]) if row else 0
     except Exception:
         return 0
 
@@ -371,9 +328,6 @@ def get_file_by_unique(user_id: int, tg_unique_id: str):
     return row
 
 def update_existing_file_from_duplicate(user_id: int, existing_id: int, tg_file_id: str, filename: str | None, caption: str | None, local_path: str | None):
-    """
-    إذا الملف كان موجود (خصوصاً إذا كان محذوف)، نحدّث بياناته ونرجّعه.
-    """
     con = db()
     cur = con.cursor()
     cur.execute(
@@ -395,18 +349,10 @@ def update_existing_file_from_duplicate(user_id: int, existing_id: int, tg_file_
 def count_by_subject(user_id: int):
     con = db()
     cur = con.cursor()
-
-    if _has_is_deleted_column():
-        cur.execute(
-            "SELECT subject, COUNT(*) cnt FROM files WHERE user_id=? AND is_deleted=0 GROUP BY subject",
-            (user_id,),
-        )
-    else:
-        cur.execute(
-            "SELECT subject, COUNT(*) cnt FROM files WHERE user_id=? GROUP BY subject",
-            (user_id,),
-        )
-
+    cur.execute(
+        "SELECT subject, COUNT(*) cnt FROM files WHERE user_id=? AND is_deleted=0 GROUP BY subject",
+        (user_id,),
+    )
     rows = cur.fetchall()
     con.close()
     return [(r[0], r[1]) for r in rows]
@@ -414,30 +360,16 @@ def count_by_subject(user_id: int):
 def list_files_by_subject(user_id: int, subject: str, limit: int = 50):
     con = db()
     cur = con.cursor()
-
-    if _has_is_deleted_column():
-        cur.execute(
-            """
-            SELECT id, file_type, filename, caption, added_at, is_fav
-            FROM files
-            WHERE user_id=? AND subject=? AND is_deleted=0
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (user_id, subject, limit),
-        )
-    else:
-        cur.execute(
-            """
-            SELECT id, file_type, filename, caption, added_at, is_fav
-            FROM files
-            WHERE user_id=? AND subject=?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (user_id, subject, limit),
-        )
-
+    cur.execute(
+        """
+        SELECT id, file_type, filename, caption, added_at, is_fav
+        FROM files
+        WHERE user_id=? AND subject=? AND is_deleted=0
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (user_id, subject, limit),
+    )
     rows = cur.fetchall()
     con.close()
     return rows
@@ -446,11 +378,7 @@ def get_file_by_id(user_id: int, file_id: int):
     con = db()
     cur = con.cursor()
     cur.execute(
-        """
-        SELECT *
-        FROM files
-        WHERE user_id=? AND id=?
-        """,
+        "SELECT * FROM files WHERE user_id=? AND id=?",
         (user_id, file_id),
     )
     row = cur.fetchone()
@@ -487,30 +415,16 @@ def restore_file(user_id: int, file_id: int):
 def list_recent(user_id: int, limit: int = 10):
     con = db()
     cur = con.cursor()
-
-    if _has_is_deleted_column():
-        cur.execute(
-            """
-            SELECT id, subject, file_type, filename, caption, added_at, is_fav
-            FROM files
-            WHERE user_id=? AND is_deleted=0
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (user_id, limit),
-        )
-    else:
-        cur.execute(
-            """
-            SELECT id, subject, file_type, filename, caption, added_at, is_fav
-            FROM files
-            WHERE user_id=?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (user_id, limit),
-        )
-
+    cur.execute(
+        """
+        SELECT id, subject, file_type, filename, caption, added_at, is_fav
+        FROM files
+        WHERE user_id=? AND is_deleted=0
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (user_id, limit),
+    )
     rows = cur.fetchall()
     con.close()
     return rows
@@ -518,30 +432,16 @@ def list_recent(user_id: int, limit: int = 10):
 def list_favorites(user_id: int, limit: int = 50):
     con = db()
     cur = con.cursor()
-
-    if _has_is_deleted_column():
-        cur.execute(
-            """
-            SELECT id, subject, file_type, filename, caption, added_at, is_fav
-            FROM files
-            WHERE user_id=? AND is_deleted=0 AND is_fav=1
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (user_id, limit),
-        )
-    else:
-        cur.execute(
-            """
-            SELECT id, subject, file_type, filename, caption, added_at, is_fav
-            FROM files
-            WHERE user_id=? AND is_fav=1
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (user_id, limit),
-        )
-
+    cur.execute(
+        """
+        SELECT id, subject, file_type, filename, caption, added_at, is_fav
+        FROM files
+        WHERE user_id=? AND is_deleted=0 AND is_fav=1
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (user_id, limit),
+    )
     rows = cur.fetchall()
     con.close()
     return rows
@@ -550,32 +450,17 @@ def search_files(user_id: int, q: str, limit: int = 30):
     like = f"%{q}%"
     con = db()
     cur = con.cursor()
-
-    if _has_is_deleted_column():
-        cur.execute(
-            """
-            SELECT id, subject, file_type, filename, caption, added_at, is_fav
-            FROM files
-            WHERE user_id=? AND is_deleted=0
-              AND (filename LIKE ? OR caption LIKE ?)
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (user_id, like, like, limit),
-        )
-    else:
-        cur.execute(
-            """
-            SELECT id, subject, file_type, filename, caption, added_at, is_fav
-            FROM files
-            WHERE user_id=?
-              AND (filename LIKE ? OR caption LIKE ?)
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (user_id, like, like, limit),
-        )
-
+    cur.execute(
+        """
+        SELECT id, subject, file_type, filename, caption, added_at, is_fav
+        FROM files
+        WHERE user_id=? AND is_deleted=0
+          AND (filename LIKE ? OR caption LIKE ?)
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (user_id, like, like, limit),
+    )
     rows = cur.fetchall()
     con.close()
     return rows
@@ -632,17 +517,11 @@ async def send_backup_to_owner(context: ContextTypes.DEFAULT_TYPE, backup_path: 
         pass
 
 async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    ✅ Auto-backup
-    - Always creates backup file in BACKUP_DIR
-    - If SILENT_BACKUP_TO_OWNER=true => no Telegram message/file is sent
-    """
     try:
         backup_name = make_backup_name()
         backup_path = Path(BACKUP_DIR) / backup_name
         make_sqlite_backup(str(backup_path))
         cleanup_old_backups()
-
         if not SILENT_BACKUP_TO_OWNER:
             await send_backup_to_owner(context, backup_path, "✅ Auto-backup (DB)")
     except Exception:
@@ -712,20 +591,12 @@ def pretty_file_line(r):
 # ============================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-
     text = (
         "👋 أهلاً وسهلاً بك\n\n"
-        "هذا بوت أرشفة خاص بمواد الجامعة 📚  \n"
-        "يتيح لك تصفّح المواد والملفات الدراسية بسهولة وسرعة.\n\n"
-        "✨ المميزات:\n"
-        "🔹 ملفات منظّمة حسب المادة\n"
-        "🔹 واجهة بسيطة وسهلة الاستخدام\n"
-        "🔹 تحميل مباشر \n"
-        "🔹 تصفح الملفات بسهولة \n\n"
-        "⬇️\n"
-        "اضغط من القائمة واختر المادة التي تريدها"
+        "هذا بوت أرشفة خاص بمواد الجامعة 📚\n"
+        "يتيح لك تصفّح المواد والملفات الدراسية بسهولة.\n\n"
+        "⬇️ اضغط من القائمة واختر المادة"
     )
-
     await update.message.reply_text(text, reply_markup=MAIN_KB)
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -748,10 +619,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "👑 أوامر الأدمن:\n"
             "• اكتب اسم المادة ثم ارسل ملفات لإضافتها.\n"
             "• /restore_latest لاسترجاع DB من آخر Backup على السيرفر.\n"
-            "• /restore_seed لاسترجاع DB من ملف Seed داخل /app (GitHub).\n"
+            "• /restore_seed لاسترجاع DB من Seed داخل /app.\n"
             "• /purge_trash تنظيف سلة المحذوفات.\n"
             "• /library عرض LIBRARY_ID الحالي.\n"
-            "• /adopt_library تبنّي المكتبة تلقائياً من DB (إذا مختلف).\n"
+            "• /adopt_library تبنّي المكتبة تلقائياً من DB.\n"
         )
     else:
         msg += "👀 أنت Viewer: تقدر تشوف وتفتح الملفات فقط."
@@ -770,7 +641,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = (update.message.text or "").strip()
 
-    # Search mode
     if context.user_data.get("search_mode"):
         context.user_data["search_mode"] = False
         rows = search_files(LIBRARY_ID, text)
@@ -782,8 +652,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "📚 المواد":
-        kb = subjects_keyboard(LIBRARY_ID)
-        await update.message.reply_text("📚 المواد:\n👇 اضغط مادة", reply_markup=kb)
+        await update.message.reply_text("📚 المواد:\n👇 اضغط مادة", reply_markup=subjects_keyboard(LIBRARY_ID))
         return
 
     if text == "🧾 آخر الملفات":
@@ -837,8 +706,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["fixed_until"] = datetime.utcnow().timestamp() + (10 * 60)
         emoji = SUBJECT_EMOJI.get(subj, "📘")
         await update.message.reply_text(
-            f"✅ ثبتت المادة مؤقتاً: {emoji} <b>{subj}</b>\n"
-            "الآن ارسل/حوّل ملفات… (10 دقائق)",
+            f"✅ ثبتت المادة مؤقتاً: {emoji} <b>{subj}</b>\nالآن ارسل/حوّل ملفات… (10 دقائق)",
             parse_mode=ParseMode.HTML,
             reply_markup=MAIN_KB,
         )
@@ -846,25 +714,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("ما فهمت 😅\nاضغط 📚 المواد أو 🔎 بحث.", reply_markup=MAIN_KB)
 
-def extract_tg_unique_id(message) -> str | None:
+def build_fingerprint(msg) -> str:
     """
-    ✅ يرجّع file_unique_id حسب نوع الرسالة.
-    إذا ما متوفر، يرجّع fallback مبني على file_id حتى لا يكون NULL.
+    بصمة قوية:
+    - document: unique_id + filename + size
+    - photo/video/audio/voice: unique_id فقط (مع prefix)
     """
     try:
-        if message.document:
-            return message.document.file_unique_id
-        if message.photo:
-            return message.photo[-1].file_unique_id
-        if message.video:
-            return message.video.file_unique_id
-        if message.audio:
-            return message.audio.file_unique_id
-        if message.voice:
-            return message.voice.file_unique_id
+        if msg.document:
+            u = msg.document.file_unique_id
+            name = msg.document.file_name or ""
+            size = msg.document.file_size or 0
+            return f"doc:{u}:{name}:{size}"
+
+        if msg.photo:
+            return f"photo:{msg.photo[-1].file_unique_id}"
+
+        if msg.video:
+            return f"video:{msg.video.file_unique_id}"
+
+        if msg.audio:
+            return f"audio:{msg.audio.file_unique_id}"
+
+        if msg.voice:
+            return f"voice:{msg.voice.file_unique_id}"
     except Exception:
         pass
-    return None
+
+    # fallback أخير جداً
+    return f"fallback:{datetime.utcnow().timestamp()}"
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -908,25 +786,15 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ نوع غير مدعوم.", reply_markup=MAIN_KB)
         return
 
-    # ✅ NEW: get unique id for de-dup
-    tg_unique_id = extract_tg_unique_id(msg)
-    if not tg_unique_id:
-        # fallback avoids NULL duplicates (not perfect across re-uploads, but prevents NULL spam)
-        tg_unique_id = f"{file_type}:{tg_file_id}"
+    tg_unique_id = build_fingerprint(msg)
 
-    # ✅ NEW: check duplicate BEFORE downloading/saving
+    # check duplicate BEFORE download
     existing = get_file_by_unique(LIBRARY_ID, tg_unique_id)
     if existing:
-        try:
-            ex_id = int(existing["id"])
-            ex_deleted = int(existing["is_deleted"]) if ("is_deleted" in existing.keys() and existing["is_deleted"] is not None) else 0
-            ex_subj = existing["subject"]
-        except Exception:
-            ex_id = None
-            ex_deleted = 0
-            ex_subj = subj
+        ex_id = int(existing["id"])
+        ex_deleted = int(existing["is_deleted"]) if existing["is_deleted"] is not None else 0
+        ex_subj = existing["subject"]
 
-        # إذا موجود وغير محذوف => رفض
         if ex_deleted == 0:
             await update.message.reply_text(
                 "⚠️ هذا الملف موجود مسبقاً بالمكتبة.\n"
@@ -945,14 +813,12 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     safe_name = safe_filename(orig_name, f"{file_type}_{ts}")
     local_path = subject_dir / f"{ts}_{safe_name}"
 
-    # نحاول نخزن محلياً
     try:
         tg_file = await context.bot.get_file(tg_file_id)
         await tg_file.download_to_drive(custom_path=str(local_path))
     except Exception:
         local_path = None
 
-    # ✅ إذا موجود لكنه محذوف => رجّعه بدل إضافة نسخة جديدة
     if existing:
         ex_id = int(existing["id"])
         update_existing_file_from_duplicate(
@@ -972,7 +838,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ✅ إدخال جديد (ليس مكرر)
     try:
         new_id = add_file_row(
             user_id=LIBRARY_ID,
@@ -982,10 +847,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tg_unique_id=tg_unique_id,
             filename=safe_name,
             caption=caption,
-            local_path=str(local_path) if local_path else None
+            local_path=str(local_path) if local_path else None,
         )
     except sqlite3.IntegrityError:
-        # في حالة سباق (رسل نفس الملف مرتين بسرعة) — القيد الفريد يمنع ويطلع هنا
         ex = get_file_by_unique(LIBRARY_ID, tg_unique_id)
         ex_id = int(ex["id"]) if ex else "?"
         await update.message.reply_text(
@@ -1033,13 +897,9 @@ async def cb_open_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("❌ الملف غير موجود.")
         return
 
-    if _has_is_deleted_column():
-        try:
-            if int(row["is_deleted"]) == 1:
-                await query.message.reply_text("❌ الملف غير موجود أو محذوف.")
-                return
-        except Exception:
-            pass
+    if int(row["is_deleted"]) == 1:
+        await query.message.reply_text("❌ الملف غير موجود أو محذوف.")
+        return
 
     filename = (row["filename"] or "").strip() or f"file_{file_id}"
     caption = row["caption"] or filename
@@ -1092,8 +952,8 @@ async def cb_open_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if is_admin(uid):
-        is_fav_val = int(row["is_fav"]) if "is_fav" in row.keys() else 0
-        is_deleted_val = int(row["is_deleted"]) if ("is_deleted" in row.keys() and row["is_deleted"] is not None) else 0
+        is_fav_val = int(row["is_fav"]) if row["is_fav"] is not None else 0
+        is_deleted_val = int(row["is_deleted"]) if row["is_deleted"] is not None else 0
         await query.message.reply_text(
             f"⚙️ <b>إدارة</b> | #{file_id}",
             parse_mode=ParseMode.HTML,
@@ -1173,8 +1033,7 @@ async def cb_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     where = query.data.split(":", 1)[1]
     if where == "subjects":
-        kb = subjects_keyboard(LIBRARY_ID)
-        await query.message.reply_text("📚 المواد:\n👇 اضغط مادة", reply_markup=kb)
+        await query.message.reply_text("📚 المواد:\n👇 اضغط مادة", reply_markup=subjects_keyboard(LIBRARY_ID))
     else:
         await query.message.reply_text("✅", reply_markup=MAIN_KB)
 
@@ -1190,22 +1049,18 @@ async def restore_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
     global LIBRARY_ID
-    detected = detect_library_id_legacy() or detect_library_id()
+    detected = detect_library_id_legacy()
     if detected:
         LIBRARY_ID = detected
 
 async def restore_seed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    ✅ يسترجع DB من ملف Seed داخل /app (GitHub repo)
-    لازم تضبط SEED_DB_PATH في Railway Variables
-    """
     uid = update.effective_user.id
     if not is_admin(uid):
         await update.message.reply_text("⛔ للأدمن فقط.")
         return
 
     if not SEED_DB_PATH:
-        await update.message.reply_text("❌ SEED_DB_PATH غير مضبوط داخل Variables في Railway.")
+        await update.message.reply_text("❌ SEED_DB_PATH غير مضبوط داخل Variables.")
         return
 
     seed = Path(SEED_DB_PATH)
@@ -1218,14 +1073,11 @@ async def restore_seed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         init_db()
 
         global LIBRARY_ID
-        detected = detect_library_id_legacy() or detect_library_id()
+        detected = detect_library_id_legacy()
         if detected:
             LIBRARY_ID = detected
 
-        await update.message.reply_text(
-            "✅ تم الاسترجاع من Seed DB بنجاح.\n"
-            f"📚 LIBRARY_ID الآن: {LIBRARY_ID}"
-        )
+        await update.message.reply_text(f"✅ تم الاسترجاع من Seed DB.\n📚 LIBRARY_ID الآن: {LIBRARY_ID}")
     except Exception as e:
         await update.message.reply_text(f"❌ فشل الاسترجاع: {e}")
 
@@ -1255,10 +1107,10 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Admins: {len(ADMIN_IDS)}\n"
         f"• Auto backup: {AUTO_BACKUP_MINUTES} min\n"
         f"• Silent backup: {'✅' if SILENT_BACKUP_TO_OWNER else '❌'}\n"
+        f"• Unique index: {'✅' if has_unique_index() else '❌'}\n"
         f"• LIBRARY_ID: {LIBRARY_ID}\n"
         f"• OWNER_ID: {OWNER_ID}\n"
         f"• SEED_DB_PATH: {SEED_DB_PATH or '(empty)'}\n"
-        f"• De-dup column: {'✅' if _has_unique_column() else '❌'}\n"
     )
     await update.message.reply_text(msg)
 
@@ -1276,9 +1128,9 @@ async def adopt_library(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     global LIBRARY_ID
-    detected = detect_library_id_legacy() or detect_library_id()
+    detected = detect_library_id_legacy()
     if detected == 0:
-        await update.message.reply_text("❌ DB فارغ أو ماكو ملفات حتى نحدد LIBRARY_ID.")
+        await update.message.reply_text("❌ DB فارغ أو ماكو ملفات.")
         return
 
     old = LIBRARY_ID
@@ -1300,14 +1152,14 @@ def main():
 
     global LIBRARY_ID
     if LIBRARY_ID == 0:
-        detected = detect_library_id_legacy() or detect_library_id()
+        detected = detect_library_id_legacy()
         if detected:
             LIBRARY_ID = detected
-        if LIBRARY_ID == 0 and OWNER_ID:
+        elif OWNER_ID:
             LIBRARY_ID = OWNER_ID
 
     if LIBRARY_ID and not library_has_any_files(LIBRARY_ID):
-        detected2 = detect_library_id_legacy() or detect_library_id()
+        detected2 = detect_library_id_legacy()
         if detected2:
             LIBRARY_ID = detected2
 
